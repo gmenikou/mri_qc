@@ -23,15 +23,13 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-# =========================================================
-# CONFIG
-# =========================================================
-
 APP_TITLE = "ACR MRI Large Phantom QC Reporter"
 
-# Change these once for your deployment
-DEFAULT_GITHUB_OWNER = "gmenikou"
-DEFAULT_GITHUB_REPO = "mri-qc"
+# -----------------------------
+# EDIT THESE 4 VALUES
+# -----------------------------
+DEFAULT_GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
+DEFAULT_GITHUB_REPO = "YOUR_REPO_NAME"
 DEFAULT_GITHUB_BRANCH = "main"
 DEFAULT_GITHUB_CSV_PATH = "acr_qc_data/acr_qc_history.csv"
 
@@ -45,8 +43,9 @@ DATA_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 CHARTS_DIR.mkdir(exist_ok=True)
 
+
 # =========================================================
-# GENERAL HELPERS
+# HELPERS
 # =========================================================
 
 def safe_float(text):
@@ -55,10 +54,12 @@ def safe_float(text):
     except Exception:
         return None
 
+
 def build_scanner_id(site_name: str, scanner_name: str) -> str:
     raw = f"{site_name.strip()}__{scanner_name.strip()}".lower()
     raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
     return raw or "unknown_scanner"
+
 
 def get_history_columns():
     return [
@@ -76,6 +77,7 @@ def get_history_columns():
         "source_file",
     ]
 
+
 def read_text_file(uploaded_file):
     raw = uploaded_file.read()
     for enc in ("utf-8", "latin-1", "cp1252"):
@@ -84,6 +86,7 @@ def read_text_file(uploaded_file):
         except Exception:
             continue
     return raw.decode("utf-8", errors="ignore")
+
 
 # =========================================================
 # PARSERS
@@ -102,6 +105,7 @@ def parse_slice_thickness(text):
         "details": f"Measured slice thickness: {value} mm" if value is not None else "Could not parse",
     }
 
+
 def parse_slice_position(text):
     m1 = re.search(r"Slice 1:\s*([0-9.\-]+)", text, re.I)
     m11 = re.search(r"Slice 11:\s*([0-9.\-]+)", text, re.I)
@@ -117,6 +121,7 @@ def parse_slice_position(text):
         "details": f"Slice 1: {v1} mm, Slice 11: {v11} mm",
     }
 
+
 def parse_snr(text):
     m = re.search(r"SNR:\s*([0-9.\-]+)", text, re.I)
     value = safe_float(m.group(1)) if m else None
@@ -130,6 +135,7 @@ def parse_snr(text):
         "details": f"SNR: {value}" if value is not None else "Could not parse",
     }
 
+
 def parse_ghosting(text):
     m = re.search(r"Ghosting Ratio calculated:\s*([0-9.\-]+)\s*%?", text, re.I)
     value = safe_float(m.group(1)) if m else None
@@ -142,6 +148,7 @@ def parse_ghosting(text):
         "status": "PASS" if passed else "FAIL",
         "details": f"Ghosting ratio: {value}%" if value is not None else "Could not parse",
     }
+
 
 def parse_lcd(text):
     t1 = re.search(r"Number of complete spokes in T1:\s*([0-9.\-]+)", text, re.I)
@@ -158,6 +165,7 @@ def parse_lcd(text):
         "details": f"T1 spokes: {v1}, T2 spokes: {v2}",
     }
 
+
 def parse_uniformity(text, modality_name):
     m = re.search(r"Calculated PIU:\s*([0-9.\-]+)", text, re.I)
     value = safe_float(m.group(1)) if m else None
@@ -170,6 +178,7 @@ def parse_uniformity(text, modality_name):
         "status": "PASS" if passed else "FAIL",
         "details": f"PIU: {value}%" if value is not None else "Could not parse",
     }
+
 
 def parse_hcr(text, modality_name):
     upper = re.search(r"Upper hole size \[mm\]:\s*([0-9.\-]+)", text, re.I)
@@ -187,6 +196,7 @@ def parse_hcr(text, modality_name):
         "details": f"Upper: {up} mm, Lower: {lo} mm",
     }
 
+
 def parse_geometric(text):
     nums = [safe_float(x) for x in re.findall(r"Length:\s*([0-9.\-]+)", text, re.I)]
     nums = [x for x in nums if x is not None]
@@ -202,6 +212,7 @@ def parse_geometric(text):
         "details": f"T1 measurements: {t1_values}",
     }
 
+
 def parse_central_frequency(text):
     m = re.search(r"Central Frequency .*?:\s*([0-9.\-]+)\s*MHz", text, re.I)
     value = safe_float(m.group(1)) if m else None
@@ -214,6 +225,7 @@ def parse_central_frequency(text):
         "status": "PASS" if passed else "FAIL",
         "details": f"Central frequency: {value} MHz" if value is not None else "Could not parse",
     }
+
 
 def infer_parser(filename, text):
     lower_name = filename.lower()
@@ -273,6 +285,7 @@ def infer_parser(filename, text):
         "details": "No parser matched this file.",
     }
 
+
 # =========================================================
 # GITHUB HELPERS
 # =========================================================
@@ -282,6 +295,7 @@ def github_headers(token):
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
     }
+
 
 def github_get_file(owner, repo, path, token, branch="main"):
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
@@ -296,6 +310,7 @@ def github_get_file(owner, repo, path, token, branch="main"):
         return None, None, None
 
     return None, None, f"GitHub read error {resp.status_code}: {resp.text}"
+
 
 def github_put_file(owner, repo, path, token, content_text, message, branch="main", sha=None):
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
@@ -314,6 +329,7 @@ def github_put_file(owner, repo, path, token, content_text, message, branch="mai
 
     return False, f"GitHub write error {resp.status_code}: {resp.text}"
 
+
 def github_delete_file(owner, repo, path, token, message, branch="main", sha=None):
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     payload = {
@@ -328,6 +344,7 @@ def github_delete_file(owner, repo, path, token, message, branch="main", sha=Non
         return True, None
 
     return False, f"GitHub delete error {resp.status_code}: {resp.text}"
+
 
 def load_history_from_github(owner, repo, path, token, branch="main"):
     content, sha, err = github_get_file(owner, repo, path, token, branch=branch)
@@ -348,6 +365,7 @@ def load_history_from_github(owner, repo, path, token, branch="main"):
 
     return df[get_history_columns()], sha, None
 
+
 def save_history_to_github(df, owner, repo, path, token, branch="main", sha=None):
     csv_text = df.to_csv(index=False)
     ok, err = github_put_file(
@@ -361,6 +379,7 @@ def save_history_to_github(df, owner, repo, path, token, branch="main", sha=None
         sha=sha,
     )
     return ok, err
+
 
 # =========================================================
 # LOCKING
@@ -395,6 +414,7 @@ def acquire_local_lock(lock_path=LOCAL_LOCK_FILE, timeout_seconds=20, stale_lock
 
         time.sleep(0.5)
 
+
 def release_local_lock(lock_path=LOCAL_LOCK_FILE):
     try:
         if lock_path.exists():
@@ -402,12 +422,14 @@ def release_local_lock(lock_path=LOCAL_LOCK_FILE):
     except Exception:
         pass
 
+
 def github_lock_path(csv_path):
     csv_path = csv_path.strip("/")
     if "/" in csv_path:
         parent = csv_path.rsplit("/", 1)[0]
         return f"{parent}/acr_qc_history.lock.json"
     return "acr_qc_history.lock.json"
+
 
 def acquire_github_lock(owner, repo, csv_path, token, branch="main", timeout_seconds=25, stale_lock_seconds=300):
     lock_path = github_lock_path(csv_path)
@@ -456,7 +478,7 @@ def acquire_github_lock(owner, repo, csv_path, token, branch="main", timeout_sec
             indent=2,
         )
 
-        ok, put_err = github_put_file(
+        ok, _ = github_put_file(
             owner=owner,
             repo=repo,
             path=lock_path,
@@ -478,6 +500,7 @@ def acquire_github_lock(owner, repo, csv_path, token, branch="main", timeout_sec
 
         time.sleep(1.0)
 
+
 def release_github_lock(owner, repo, csv_path, token, branch="main"):
     lock_path = github_lock_path(csv_path)
     content, sha, err = github_get_file(owner, repo, lock_path, token, branch=branch)
@@ -495,6 +518,7 @@ def release_github_lock(owner, repo, csv_path, token, branch="main"):
         branch=branch,
         sha=sha,
     )
+
 
 # =========================================================
 # HISTORY STORAGE
@@ -522,8 +546,10 @@ def load_history(local_only=True, github_cfg=None):
 
     return df[get_history_columns()], None, None
 
+
 def save_history_local(df):
     df.to_csv(LOCAL_HISTORY_CSV, index=False)
+
 
 def append_results_to_history(
     results,
@@ -573,6 +599,7 @@ def append_results_to_history(
         sha=sha,
     )
     return updated, ok, err
+
 
 def save_results_with_lock(
     results,
@@ -643,6 +670,7 @@ def save_results_with_lock(
             branch=github_cfg["branch"],
         )
 
+
 # =========================================================
 # CHARTS / PDF
 # =========================================================
@@ -652,6 +680,7 @@ def fig_to_rl_image(fig, width=500):
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
     buf.seek(0)
     return RLImage(buf, width=width, height=width * 0.58)
+
 
 def create_trend_chart(df, test_name):
     sub = df[df["test_name"] == test_name].copy()
@@ -673,6 +702,7 @@ def create_trend_chart(df, test_name):
     fig.savefig(chart_path, bbox_inches="tight", dpi=160)
     return fig, chart_path
 
+
 def add_reference_lines(ax, selected_test):
     if selected_test == "Slice Thickness Accuracy":
         ax.axhline(4.3, linestyle="--", alpha=0.7)
@@ -684,6 +714,7 @@ def add_reference_lines(ax, selected_test):
     elif selected_test == "Geometric Accuracy":
         ax.axhline(188, linestyle="--", alpha=0.7)
         ax.axhline(192, linestyle="--", alpha=0.7)
+
 
 def build_pdf_report(results_df, history_df, site_name, scanner_name, session_label, timestamp_str):
     pdf_path = REPORTS_DIR / f"ACR_QC_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
@@ -755,8 +786,9 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
     doc.build(elements)
     return pdf_path
 
+
 # =========================================================
-# UI
+# APP
 # =========================================================
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -766,39 +798,37 @@ st.caption(
     "and generate a PDF report with trendlines."
 )
 
-# Secrets-aware token
 try:
     SECRET_GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
 except Exception:
     SECRET_GITHUB_TOKEN = ""
 
+preloaded_scanners = []
+if (
+    SECRET_GITHUB_TOKEN
+    and DEFAULT_GITHUB_OWNER != "YOUR_GITHUB_USERNAME"
+    and DEFAULT_GITHUB_REPO != "YOUR_REPO_NAME"
+):
+    content, _, _ = github_get_file(
+        DEFAULT_GITHUB_OWNER,
+        DEFAULT_GITHUB_REPO,
+        DEFAULT_GITHUB_CSV_PATH,
+        SECRET_GITHUB_TOKEN,
+        branch=DEFAULT_GITHUB_BRANCH,
+    )
+    if content:
+        try:
+            preload_df = pd.read_csv(io.StringIO(content))
+            if "scanner_name" in preload_df.columns:
+                preloaded_scanners = sorted(
+                    [x for x in preload_df["scanner_name"].dropna().astype(str).unique().tolist() if x]
+                )
+        except Exception:
+            pass
+
 with st.sidebar:
     st.header("Session info")
-
     site_name = st.text_input("Site / Hospital", value="My MRI Site")
-
-    # Preload scanners from GitHub if possible
-    preloaded_scanners = []
-    preload_error = None
-    auto_github_token = SECRET_GITHUB_TOKEN
-
-    if auto_github_token and DEFAULT_GITHUB_OWNER != "YOUR_GITHUB_USERNAME" and DEFAULT_GITHUB_REPO != "YOUR_REPO_NAME":
-        content, _, preload_error = github_get_file(
-            DEFAULT_GITHUB_OWNER,
-            DEFAULT_GITHUB_REPO,
-            DEFAULT_GITHUB_CSV_PATH,
-            auto_github_token,
-            branch=DEFAULT_GITHUB_BRANCH,
-        )
-        if content:
-            try:
-                preload_df = pd.read_csv(io.StringIO(content))
-                if "scanner_name" in preload_df.columns:
-                    preloaded_scanners = sorted(
-                        [x for x in preload_df["scanner_name"].dropna().astype(str).unique().tolist() if x]
-                    )
-            except Exception:
-                pass
 
     if preloaded_scanners:
         scanner_name = st.selectbox("Scanner / System", options=preloaded_scanners, index=0)
@@ -829,7 +859,7 @@ with st.sidebar:
     github_repo = st.text_input("GitHub repository", value=DEFAULT_GITHUB_REPO)
     github_branch = st.text_input("GitHub branch", value=DEFAULT_GITHUB_BRANCH)
     github_path = st.text_input("GitHub CSV path", value=DEFAULT_GITHUB_CSV_PATH)
-    st.caption("Tip: on Streamlit Cloud, store GITHUB_TOKEN in app secrets so you do not need to paste it here.")
+    st.caption("Tip: store GITHUB_TOKEN in Streamlit secrets so you do not need to paste it here.")
 
 use_github = storage_mode == "GitHub CSV"
 github_cfg = None
@@ -943,17 +973,23 @@ if uploaded_files:
                 )
             st.success(f"PDF report created: {pdf_path}")
 
-    st.subheader("Integrated trend dashboard")
 
-    history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
-    if load_err:
-        st.error(load_err)
-        history_df = pd.DataFrame(columns=get_history_columns())
+# =========================================================
+# TREND DASHBOARD ALWAYS VISIBLE
+# =========================================================
 
-    trend_source = history_df.copy()
-    if not trend_source.empty:
-        trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
+st.subheader("Integrated trend dashboard")
 
+history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+if load_err:
+    st.error(load_err)
+    history_df = pd.DataFrame(columns=get_history_columns())
+
+trend_source = history_df.copy()
+if not trend_source.empty:
+    trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
+
+if uploaded_files and parsed_results:
     current_rows = pd.DataFrame(
         [
             {
@@ -973,186 +1009,186 @@ if uploaded_files:
             for r in parsed_results
         ]
     )
-
     trend_source = pd.concat([trend_source, current_rows], ignore_index=True)
+
+if not trend_source.empty:
     trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
 
-    if not trend_source.empty:
-        all_systems = sorted(
-            [x for x in trend_source["scanner_id"].dropna().astype(str).unique().tolist() if x]
-        )
+    all_systems = sorted(
+        [x for x in trend_source["scanner_id"].dropna().astype(str).unique().tolist() if x]
+    )
 
-        detected_scanners = []
-        current_match = trend_source[
-            (trend_source["site_name"].astype(str) == str(site_name))
-            & (trend_source["scanner_name"].astype(str) == str(scanner_name))
-        ]
-        if not current_match.empty:
-            detected_scanners = sorted(current_match["scanner_id"].dropna().astype(str).unique().tolist())
+    detected_scanners = []
+    current_match = trend_source[
+        (trend_source["site_name"].astype(str) == str(site_name))
+        & (trend_source["scanner_name"].astype(str) == str(scanner_name))
+    ]
+    if not current_match.empty:
+        detected_scanners = sorted(current_match["scanner_id"].dropna().astype(str).unique().tolist())
 
-        default_systems = [scanner_id] if default_to_current_scanner and scanner_id in all_systems else all_systems
-        if detected_scanners and default_to_current_scanner:
-            default_systems = detected_scanners
+    default_systems = [scanner_id] if default_to_current_scanner and scanner_id in all_systems else all_systems
+    if detected_scanners and default_to_current_scanner:
+        default_systems = detected_scanners
 
-        selected_systems = st.multiselect("Systems to include", all_systems, default=default_systems)
-        if selected_systems:
-            trend_source = trend_source[trend_source["scanner_id"].isin(selected_systems)]
-        else:
-            trend_source = trend_source.iloc[0:0]
-
-        if detected_scanners:
-            st.caption("Detected matching scanner history: " + ", ".join(detected_scanners))
-
-    if trend_source.empty:
-        st.info("No trend data available yet.")
+    selected_systems = st.multiselect("Systems to include", all_systems, default=default_systems)
+    if selected_systems:
+        trend_source = trend_source[trend_source["scanner_id"].isin(selected_systems)]
     else:
-        numeric_trend = trend_source.dropna(subset=["value"]).copy()
-        numeric_tests = sorted(numeric_trend["test_name"].dropna().unique().tolist())
+        trend_source = trend_source.iloc[0:0]
 
-        if numeric_tests:
-            left, right = st.columns([2, 1])
-            with left:
-                selected_test = st.selectbox("Choose test for trend analysis", numeric_tests, index=0)
-            with right:
-                show_only_saved = st.checkbox("Only saved history", value=False)
+    if detected_scanners:
+        st.caption("Detected matching scanner history: " + ", ".join(detected_scanners))
 
-            display_df = numeric_trend.copy()
-            if show_only_saved:
-                display_df = history_df.copy()
-                if not display_df.empty:
-                    display_df["timestamp"] = pd.to_datetime(display_df["timestamp"], errors="coerce")
-                    display_df = display_df.dropna(subset=["value"])
-                    if selected_systems:
-                        display_df = display_df[display_df["scanner_id"].isin(selected_systems)]
+if trend_source.empty:
+    st.info("No trend data available yet.")
+else:
+    numeric_trend = trend_source.dropna(subset=["value"]).copy()
+    numeric_tests = sorted(numeric_trend["test_name"].dropna().unique().tolist())
 
-            test_df = display_df[display_df["test_name"] == selected_test].sort_values("timestamp")
+    if numeric_tests:
+        left, right = st.columns([2, 1])
+        with left:
+            selected_test = st.selectbox("Choose test for trend analysis", numeric_tests, index=0)
+        with right:
+            show_only_saved = st.checkbox("Only saved history", value=False)
 
-            metric_cols = st.columns(4)
-            if not test_df.empty:
-                latest = test_df.iloc[-1]["value"]
-                mean_val = test_df["value"].mean()
-                min_val = test_df["value"].min()
-                max_val = test_df["value"].max()
+        display_df = numeric_trend.copy()
+        if show_only_saved:
+            display_df = history_df.copy()
+            if not display_df.empty:
+                display_df["timestamp"] = pd.to_datetime(display_df["timestamp"], errors="coerce")
+                display_df = display_df.dropna(subset=["value"])
+                if "selected_systems" in locals() and selected_systems:
+                    display_df = display_df[display_df["scanner_id"].isin(selected_systems)]
 
-                metric_cols[0].metric("Latest", f"{latest:.3f}")
-                metric_cols[1].metric("Mean", f"{mean_val:.3f}")
-                metric_cols[2].metric("Min", f"{min_val:.3f}")
-                metric_cols[3].metric("Max", f"{max_val:.3f}")
+        test_df = display_df[display_df["test_name"] == selected_test].sort_values("timestamp")
 
-                systems_for_test = sorted(test_df["scanner_id"].dropna().astype(str).unique().tolist())
+        metric_cols = st.columns(4)
+        if not test_df.empty:
+            latest = test_df.iloc[-1]["value"]
+            mean_val = test_df["value"].mean()
+            min_val = test_df["value"].min()
+            max_val = test_df["value"].max()
 
-                if len(systems_for_test) > 1:
-                    tabs = st.tabs(systems_for_test + ["Combined"])
+            metric_cols[0].metric("Latest", f"{latest:.3f}")
+            metric_cols[1].metric("Mean", f"{mean_val:.3f}")
+            metric_cols[2].metric("Min", f"{min_val:.3f}")
+            metric_cols[3].metric("Max", f"{max_val:.3f}")
 
-                    for sys_name, tab in zip(systems_for_test, tabs[:-1]):
-                        with tab:
-                            sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp")
-                            fig, ax = plt.subplots(figsize=(8, 4.2))
-                            ax.plot(sys_df["timestamp"], sys_df["value"], marker="o")
-                            ax.set_title(f"{selected_test} | {sys_name}")
-                            unit = sys_df["unit"].dropna().iloc[0] if not sys_df["unit"].dropna().empty else ""
-                            ax.set_xlabel("Timestamp")
-                            ax.set_ylabel(f"Value ({unit})")
-                            ax.grid(True, alpha=0.3)
-                            add_reference_lines(ax, selected_test)
-                            fig.autofmt_xdate()
-                            st.pyplot(fig)
-                            plt.close(fig)
+            systems_for_test = sorted(test_df["scanner_id"].dropna().astype(str).unique().tolist())
 
-                            st.dataframe(
-                                sys_df[
-                                    [
-                                        "timestamp",
-                                        "site_name",
-                                        "scanner_name",
-                                        "scanner_id",
-                                        "session_label",
-                                        "test_name",
-                                        "value",
-                                        "unit",
-                                        "status",
-                                        "details",
-                                    ]
-                                ],
-                                use_container_width=True,
-                            )
+            if len(systems_for_test) > 1:
+                tabs = st.tabs(systems_for_test + ["Combined"])
 
-                    with tabs[-1]:
+                for sys_name, tab in zip(systems_for_test, tabs[:-1]):
+                    with tab:
+                        sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp")
                         fig, ax = plt.subplots(figsize=(8, 4.2))
-                        for sys_name in systems_for_test:
-                            sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp")
-                            ax.plot(sys_df["timestamp"], sys_df["value"], marker="o", label=sys_name)
-                        ax.set_title(f"{selected_test} | Combined systems")
-                        unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
+                        ax.plot(sys_df["timestamp"], sys_df["value"], marker="o")
+                        ax.set_title(f"{selected_test} | {sys_name}")
+                        unit = sys_df["unit"].dropna().iloc[0] if not sys_df["unit"].dropna().empty else ""
                         ax.set_xlabel("Timestamp")
                         ax.set_ylabel(f"Value ({unit})")
                         ax.grid(True, alpha=0.3)
-                        ax.legend()
                         add_reference_lines(ax, selected_test)
                         fig.autofmt_xdate()
                         st.pyplot(fig)
                         plt.close(fig)
-                else:
+
+                        st.dataframe(
+                            sys_df[
+                                [
+                                    "timestamp",
+                                    "site_name",
+                                    "scanner_name",
+                                    "scanner_id",
+                                    "session_label",
+                                    "test_name",
+                                    "value",
+                                    "unit",
+                                    "status",
+                                    "details",
+                                ]
+                            ],
+                            use_container_width=True,
+                        )
+
+                with tabs[-1]:
                     fig, ax = plt.subplots(figsize=(8, 4.2))
-                    ax.plot(test_df["timestamp"], test_df["value"], marker="o")
-                    ax.set_title(selected_test)
+                    for sys_name in systems_for_test:
+                        sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp")
+                        ax.plot(sys_df["timestamp"], sys_df["value"], marker="o", label=sys_name)
+                    ax.set_title(f"{selected_test} | Combined systems")
                     unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
                     ax.set_xlabel("Timestamp")
                     ax.set_ylabel(f"Value ({unit})")
                     ax.grid(True, alpha=0.3)
+                    ax.legend()
                     add_reference_lines(ax, selected_test)
                     fig.autofmt_xdate()
                     st.pyplot(fig)
                     plt.close(fig)
-
-                st.markdown("**Trend data table**")
-                st.dataframe(
-                    test_df[
-                        [
-                            "timestamp",
-                            "site_name",
-                            "scanner_name",
-                            "scanner_id",
-                            "session_label",
-                            "test_name",
-                            "value",
-                            "unit",
-                            "status",
-                            "details",
-                        ]
-                    ],
-                    use_container_width=True,
-                )
-
-                trend_csv = test_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download selected trend CSV",
-                    data=trend_csv,
-                    file_name=f"{selected_test.replace(' ', '_').replace('/', '_')}_trend.csv",
-                    mime="text/csv",
-                )
             else:
-                st.info("No numeric trend data yet for the selected test.")
+                fig, ax = plt.subplots(figsize=(8, 4.2))
+                ax.plot(test_df["timestamp"], test_df["value"], marker="o")
+                ax.set_title(selected_test)
+                unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
+                ax.set_xlabel("Timestamp")
+                ax.set_ylabel(f"Value ({unit})")
+                ax.grid(True, alpha=0.3)
+                add_reference_lines(ax, selected_test)
+                fig.autofmt_xdate()
+                st.pyplot(fig)
+                plt.close(fig)
 
-        st.markdown("**All saved history**")
-        if history_df.empty:
-            st.info("No saved history yet. Upload files and click 'Save session to history'.")
-        else:
-            sorted_history = history_df.sort_values(["scanner_id", "timestamp"], ascending=[True, True]).copy()
-            if group_history_by_scanner:
-                for sys_name in sorted(sorted_history["scanner_id"].dropna().astype(str).unique().tolist()):
-                    st.markdown(f"**Scanner: {sys_name}**")
-                    st.dataframe(sorted_history[sorted_history["scanner_id"] == sys_name], use_container_width=True)
-            else:
-                st.dataframe(sorted_history, use_container_width=True)
+            st.markdown("**Trend data table**")
+            st.dataframe(
+                test_df[
+                    [
+                        "timestamp",
+                        "site_name",
+                        "scanner_name",
+                        "scanner_id",
+                        "session_label",
+                        "test_name",
+                        "value",
+                        "unit",
+                        "status",
+                        "details",
+                    ]
+                ],
+                use_container_width=True,
+            )
 
-            csv_bytes = history_df.to_csv(index=False).encode("utf-8")
+            trend_csv = test_df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                "Download full history CSV",
-                data=csv_bytes,
-                file_name="acr_qc_history.csv",
+                "Download selected trend CSV",
+                data=trend_csv,
+                file_name=f"{selected_test.replace(' ', '_').replace('/', '_')}_trend.csv",
                 mime="text/csv",
             )
+        else:
+            st.info("No numeric trend data yet for the selected test.")
+
+    st.markdown("**All saved history**")
+    if history_df.empty:
+        st.info("No saved history yet. Upload files and click 'Save session to history'.")
+    else:
+        sorted_history = history_df.sort_values(["scanner_id", "timestamp"], ascending=[True, True]).copy()
+        if group_history_by_scanner:
+            for sys_name in sorted(sorted_history["scanner_id"].dropna().astype(str).unique().tolist()):
+                st.markdown(f"**Scanner: {sys_name}**")
+                st.dataframe(sorted_history[sorted_history["scanner_id"] == sys_name], use_container_width=True)
+        else:
+            st.dataframe(sorted_history, use_container_width=True)
+
+        csv_bytes = history_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download full history CSV",
+            data=csv_bytes,
+            file_name="acr_qc_history.csv",
+            mime="text/csv",
+        )
 
 st.divider()
 st.subheader("History summary")
