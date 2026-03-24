@@ -1,23 +1,43 @@
-
 import re
 import io
 import json
+import time
+import uuid
 import base64
-import requests
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
 import matplotlib.pyplot as plt
+import pandas as pd
+import requests
 import streamlit as st
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+from reportlab.platypus import (
+    Image as RLImage,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 APP_TITLE = "ACR MRI Large Phantom QC Reporter"
+
+# Change these once for your deployment
+DEFAULT_GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
+DEFAULT_GITHUB_REPO = "YOUR_REPO_NAME"
+DEFAULT_GITHUB_BRANCH = "main"
+DEFAULT_GITHUB_CSV_PATH = "acr_qc_data/acr_qc_history.csv"
+
 DATA_DIR = Path("acr_qc_data")
 LOCAL_HISTORY_CSV = DATA_DIR / "acr_qc_history.csv"
+LOCAL_LOCK_FILE = DATA_DIR / "acr_qc_history.lock"
 REPORTS_DIR = DATA_DIR / "reports"
 CHARTS_DIR = DATA_DIR / "charts"
 
@@ -25,25 +45,36 @@ DATA_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 CHARTS_DIR.mkdir(exist_ok=True)
 
-TEST_MAP = {
-    "Slice Thickness": "Slice Thickness Accuracy",
-    "Position": "Slice Position Accuracy",
-    "SNR": "Signal to Noise Ratio",
-    "Ghosting": "Percentage Signal Ghosting",
-    "LCD": "Low Contrast Detectability",
-    "Image Uniformity T2": "Image Uniformity T2",
-    "Image Uniformity Test T1": "Image Uniformity T1",
-    "HCR-T2": "High Contrast Spatial Resolution T2",
-    "HCR-T1": "High Contrast Spatial Resolution T1",
-    "Geometric Accuracy": "Geometric Accuracy",
-    "Central Frequency": "Central Frequency",
-}
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
 
 def safe_float(text):
     try:
         return float(text)
     except Exception:
         return None
+
+def build_scanner_id(site_name: str, scanner_name: str) -> str:
+    raw = f"{site_name.strip()}__{scanner_name.strip()}".lower()
+    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    return raw or "unknown_scanner"
+
+def get_history_columns():
+    return [
+        "timestamp",
+        "session_label",
+        "site_name",
+        "scanner_name",
+        "scanner_id",
+        "test_name",
+        "value",
+        "unit",
+        "criteria",
+        "status",
+        "details",
+        "source_file",
+    ]
 
 def read_text_file(uploaded_file):
     raw = uploaded_file.read()
@@ -54,13 +85,22 @@ def read_text_file(uploaded_file):
             continue
     return raw.decode("utf-8", errors="ignore")
 
+# =========================================================
+# PARSERS
+# =========================================================
+
 def parse_slice_thickness(text):
     m = re.search(r"Slice thickness:\s*([0-9.\-]+)", text, re.I)
     value = safe_float(m.group(1)) if m else None
     passed = value is not None and 4.3 <= value <= 5.7
-    return {"test_name": "Slice Thickness Accuracy", "value": value, "unit": "mm",
-            "criteria": "4.3 to 5.7 mm", "status": "PASS" if passed else "FAIL",
-            "details": f"Measured slice thickness: {value} mm" if value is not None else "Could not parse"}
+    return {
+        "test_name": "Slice Thickness Accuracy",
+        "value": value,
+        "unit": "mm",
+        "criteria": "4.3 to 5.7 mm",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"Measured slice thickness: {value} mm" if value is not None else "Could not parse",
+    }
 
 def parse_slice_position(text):
     m1 = re.search(r"Slice 1:\s*([0-9.\-]+)", text, re.I)
@@ -68,45 +108,68 @@ def parse_slice_position(text):
     v1 = safe_float(m1.group(1)) if m1 else None
     v11 = safe_float(m11.group(1)) if m11 else None
     passed = (v1 is not None and abs(v1) <= 5) and (v11 is not None and abs(v11) <= 5)
-    return {"test_name": "Slice Position Accuracy", "value": None, "unit": "mm",
-            "criteria": "Absolute value of Slice 1 and Slice 11 <= 5 mm", "status": "PASS" if passed else "FAIL",
-            "details": f"Slice 1: {v1} mm, Slice 11: {v11} mm"}
+    return {
+        "test_name": "Slice Position Accuracy",
+        "value": None,
+        "unit": "mm",
+        "criteria": "Absolute value of Slice 1 and Slice 11 <= 5 mm",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"Slice 1: {v1} mm, Slice 11: {v11} mm",
+    }
 
 def parse_snr(text):
     m = re.search(r"SNR:\s*([0-9.\-]+)", text, re.I)
     value = safe_float(m.group(1)) if m else None
-    # ACR generally trends SNR against baseline.
     passed = value is not None
-    return {"test_name": "Signal to Noise Ratio", "value": value, "unit": "",
-            "criteria": "Compare to site baseline / trend", "status": "PASS" if passed else "FAIL",
-            "details": f"SNR: {value}" if value is not None else "Could not parse"}
+    return {
+        "test_name": "Signal to Noise Ratio",
+        "value": value,
+        "unit": "",
+        "criteria": "Compare to site baseline / trend",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"SNR: {value}" if value is not None else "Could not parse",
+    }
 
 def parse_ghosting(text):
     m = re.search(r"Ghosting Ratio calculated:\s*([0-9.\-]+)\s*%?", text, re.I)
     value = safe_float(m.group(1)) if m else None
     passed = value is not None and value <= 2.5
-    return {"test_name": "Percentage Signal Ghosting", "value": value, "unit": "%",
-            "criteria": "<= 2.5%", "status": "PASS" if passed else "FAIL",
-            "details": f"Ghosting ratio: {value}%" if value is not None else "Could not parse"}
+    return {
+        "test_name": "Percentage Signal Ghosting",
+        "value": value,
+        "unit": "%",
+        "criteria": "<= 2.5%",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"Ghosting ratio: {value}%" if value is not None else "Could not parse",
+    }
 
 def parse_lcd(text):
     t1 = re.search(r"Number of complete spokes in T1:\s*([0-9.\-]+)", text, re.I)
     t2 = re.search(r"Number of complete spokes in T2:\s*([0-9.\-]+)", text, re.I)
     v1 = safe_float(t1.group(1)) if t1 else None
     v2 = safe_float(t2.group(1)) if t2 else None
-    # Threshold can vary by protocol/slice; 37 is commonly treated as strong performance.
     passed = (v1 is not None and v1 >= 37) and (v2 is not None and v2 >= 37)
-    return {"test_name": "Low Contrast Detectability", "value": None, "unit": "spokes",
-            "criteria": "Site/ACR target threshold, commonly >= 37 for strong performance", "status": "PASS" if passed else "FAIL",
-            "details": f"T1 spokes: {v1}, T2 spokes: {v2}"}
+    return {
+        "test_name": "Low Contrast Detectability",
+        "value": None,
+        "unit": "spokes",
+        "criteria": "Site/ACR target threshold, commonly >= 37 for strong performance",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"T1 spokes: {v1}, T2 spokes: {v2}",
+    }
 
 def parse_uniformity(text, modality_name):
     m = re.search(r"Calculated PIU:\s*([0-9.\-]+)", text, re.I)
     value = safe_float(m.group(1)) if m else None
     passed = value is not None and value >= 87.5
-    return {"test_name": modality_name, "value": value, "unit": "%",
-            "criteria": ">= 87.5%", "status": "PASS" if passed else "FAIL",
-            "details": f"PIU: {value}%" if value is not None else "Could not parse"}
+    return {
+        "test_name": modality_name,
+        "value": value,
+        "unit": "%",
+        "criteria": ">= 87.5%",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"PIU: {value}%" if value is not None else "Could not parse",
+    }
 
 def parse_hcr(text, modality_name):
     upper = re.search(r"Upper hole size \[mm\]:\s*([0-9.\-]+)", text, re.I)
@@ -114,29 +177,47 @@ def parse_hcr(text, modality_name):
     up = safe_float(upper.group(1)) if upper else None
     lo = safe_float(lower.group(1)) if lower else None
     passed = (up is not None and up <= 1.0) and (lo is not None and lo <= 1.0)
-    return {"test_name": modality_name, "value": max([v for v in [up, lo] if v is not None], default=None), "unit": "mm",
-            "criteria": "Must resolve 1.0 mm holes", "status": "PASS" if passed else "FAIL",
-            "details": f"Upper: {up} mm, Lower: {lo} mm"}
+    best_value = max([v for v in [up, lo] if v is not None], default=None)
+    return {
+        "test_name": modality_name,
+        "value": best_value,
+        "unit": "mm",
+        "criteria": "Must resolve 1.0 mm holes",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"Upper: {up} mm, Lower: {lo} mm",
+    }
 
 def parse_geometric(text):
     nums = [safe_float(x) for x in re.findall(r"Length:\s*([0-9.\-]+)", text, re.I)]
     nums = [x for x in nums if x is not None]
     t1_values = [x for x in nums if 180 <= x <= 200]
     passed = bool(t1_values) and all(188 <= x <= 192 for x in t1_values)
-    return {"test_name": "Geometric Accuracy", "value": sum(t1_values)/len(t1_values) if t1_values else None, "unit": "mm",
-            "criteria": "T1 dimensions should be 190 +/- 2 mm", "status": "PASS" if passed else "FAIL",
-            "details": f"T1 measurements: {t1_values}"}
+    value = sum(t1_values) / len(t1_values) if t1_values else None
+    return {
+        "test_name": "Geometric Accuracy",
+        "value": value,
+        "unit": "mm",
+        "criteria": "T1 dimensions should be 190 +/- 2 mm",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"T1 measurements: {t1_values}",
+    }
 
 def parse_central_frequency(text):
     m = re.search(r"Central Frequency .*?:\s*([0-9.\-]+)\s*MHz", text, re.I)
     value = safe_float(m.group(1)) if m else None
     passed = value is not None
-    return {"test_name": "Central Frequency", "value": value, "unit": "MHz",
-            "criteria": "Trend against system baseline", "status": "PASS" if passed else "FAIL",
-            "details": f"Central frequency: {value} MHz" if value is not None else "Could not parse"}
+    return {
+        "test_name": "Central Frequency",
+        "value": value,
+        "unit": "MHz",
+        "criteria": "Trend against system baseline",
+        "status": "PASS" if passed else "FAIL",
+        "details": f"Central frequency: {value} MHz" if value is not None else "Could not parse",
+    }
 
 def infer_parser(filename, text):
     lower_name = filename.lower()
+
     if "slice thickness" in lower_name:
         return parse_slice_thickness(text)
     if "position" in lower_name:
@@ -160,7 +241,6 @@ def infer_parser(filename, text):
     if "central frequency" in lower_name:
         return parse_central_frequency(text)
 
-    # Fallback by content
     if "Slice Thickness Accuracy Test" in text:
         return parse_slice_thickness(text)
     if "Slice Position Accuracy Test" in text:
@@ -184,9 +264,18 @@ def infer_parser(filename, text):
     if "Central Frequency Test" in text:
         return parse_central_frequency(text)
 
-    return {"test_name": filename, "value": None, "unit": "", "criteria": "Unknown",
-            "status": "FAIL", "details": "No parser matched this file."}
+    return {
+        "test_name": filename,
+        "value": None,
+        "unit": "",
+        "criteria": "Unknown",
+        "status": "FAIL",
+        "details": "No parser matched this file.",
+    }
 
+# =========================================================
+# GITHUB HELPERS
+# =========================================================
 
 def github_headers(token):
     return {
@@ -197,12 +286,15 @@ def github_headers(token):
 def github_get_file(owner, repo, path, token, branch="main"):
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     resp = requests.get(url, headers=github_headers(token), params={"ref": branch}, timeout=30)
+
     if resp.status_code == 200:
         payload = resp.json()
         content = base64.b64decode(payload["content"]).decode("utf-8")
         return content, payload.get("sha"), None
+
     if resp.status_code == 404:
         return None, None, None
+
     return None, None, f"GitHub read error {resp.status_code}: {resp.text}"
 
 def github_put_file(owner, repo, path, token, content_text, message, branch="main", sha=None):
@@ -214,30 +306,46 @@ def github_put_file(owner, repo, path, token, content_text, message, branch="mai
     }
     if sha:
         payload["sha"] = sha
+
     resp = requests.put(url, headers=github_headers(token), json=payload, timeout=30)
+
     if resp.status_code in (200, 201):
         return True, None
+
     return False, f"GitHub write error {resp.status_code}: {resp.text}"
 
-def get_history_columns():
-    return [
-        "timestamp", "session_label", "site_name", "scanner_name", "scanner_id",
-        "test_name", "value", "unit", "criteria", "status", "details", "source_file"
-    ]
+def github_delete_file(owner, repo, path, token, message, branch="main", sha=None):
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    payload = {
+        "message": message,
+        "branch": branch,
+        "sha": sha,
+    }
+
+    resp = requests.delete(url, headers=github_headers(token), json=payload, timeout=30)
+
+    if resp.status_code in (200, 204):
+        return True, None
+
+    return False, f"GitHub delete error {resp.status_code}: {resp.text}"
 
 def load_history_from_github(owner, repo, path, token, branch="main"):
     content, sha, err = github_get_file(owner, repo, path, token, branch=branch)
     if err:
         return pd.DataFrame(columns=get_history_columns()), None, err
+
     if content is None:
         return pd.DataFrame(columns=get_history_columns()), None, None
+
     try:
         df = pd.read_csv(io.StringIO(content))
     except Exception as e:
         return pd.DataFrame(columns=get_history_columns()), None, f"Could not parse GitHub CSV: {e}"
+
     for col in get_history_columns():
         if col not in df.columns:
             df[col] = None
+
     return df[get_history_columns()], sha, None
 
 def save_history_to_github(df, owner, repo, path, token, branch="main", sha=None):
@@ -254,54 +362,290 @@ def save_history_to_github(df, owner, repo, path, token, branch="main", sha=None
     )
     return ok, err
 
-def build_scanner_id(site_name, scanner_name):
-    raw = f"{site_name.strip()}__{scanner_name.strip()}".lower()
-    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
-    return raw or "unknown_scanner"
+# =========================================================
+# LOCKING
+# =========================================================
+
+def acquire_local_lock(lock_path=LOCAL_LOCK_FILE, timeout_seconds=20, stale_lock_seconds=300):
+    start = time.time()
+    while True:
+        if lock_path.exists():
+            age = time.time() - lock_path.stat().st_mtime
+            if age > stale_lock_seconds:
+                try:
+                    lock_path.unlink()
+                except Exception:
+                    pass
+        try:
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "lock_id": str(uuid.uuid4()),
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return True
+        except Exception:
+            pass
+
+        if time.time() - start > timeout_seconds:
+            return False
+
+        time.sleep(0.5)
+
+def release_local_lock(lock_path=LOCAL_LOCK_FILE):
+    try:
+        if lock_path.exists():
+            lock_path.unlink()
+    except Exception:
+        pass
+
+def github_lock_path(csv_path):
+    csv_path = csv_path.strip("/")
+    if "/" in csv_path:
+        parent = csv_path.rsplit("/", 1)[0]
+        return f"{parent}/acr_qc_history.lock.json"
+    return "acr_qc_history.lock.json"
+
+def acquire_github_lock(owner, repo, csv_path, token, branch="main", timeout_seconds=25, stale_lock_seconds=300):
+    lock_path = github_lock_path(csv_path)
+    start = time.time()
+
+    while True:
+        content, sha, err = github_get_file(owner, repo, lock_path, token, branch=branch)
+        now = datetime.now()
+
+        if err:
+            return False, None, f"GitHub lock read error: {err}"
+
+        if content is not None:
+            try:
+                payload = json.loads(content)
+                created_at = datetime.fromisoformat(payload.get("created_at"))
+                if (now - created_at).total_seconds() > stale_lock_seconds:
+                    github_delete_file(
+                        owner=owner,
+                        repo=repo,
+                        path=lock_path,
+                        token=token,
+                        message="Remove stale ACR QC lock",
+                        branch=branch,
+                        sha=sha,
+                    )
+                else:
+                    if time.time() - start > timeout_seconds:
+                        return False, None, "Could not acquire GitHub lock. Another user may be saving right now."
+                    time.sleep(1.0)
+                    continue
+            except Exception:
+                if time.time() - start > timeout_seconds:
+                    return False, None, "Could not interpret existing GitHub lock file."
+                time.sleep(1.0)
+                continue
+
+        lock_payload = json.dumps(
+            {
+                "lock_id": str(uuid.uuid4()),
+                "created_at": now.isoformat(timespec="seconds"),
+                "owner": owner,
+                "repo": repo,
+                "path": csv_path,
+            },
+            indent=2,
+        )
+
+        ok, put_err = github_put_file(
+            owner=owner,
+            repo=repo,
+            path=lock_path,
+            token=token,
+            content_text=lock_payload,
+            message="Acquire ACR QC lock",
+            branch=branch,
+            sha=None,
+        )
+
+        if ok:
+            latest_content, latest_sha, latest_err = github_get_file(owner, repo, lock_path, token, branch=branch)
+            if latest_err:
+                return False, None, latest_err
+            return True, latest_sha, None
+
+        if time.time() - start > timeout_seconds:
+            return False, None, "Could not acquire GitHub lock. Another user may be saving right now."
+
+        time.sleep(1.0)
+
+def release_github_lock(owner, repo, csv_path, token, branch="main"):
+    lock_path = github_lock_path(csv_path)
+    content, sha, err = github_get_file(owner, repo, lock_path, token, branch=branch)
+    if err:
+        return False, err
+    if content is None or not sha:
+        return True, None
+
+    return github_delete_file(
+        owner=owner,
+        repo=repo,
+        path=lock_path,
+        token=token,
+        message="Release ACR QC lock",
+        branch=branch,
+        sha=sha,
+    )
+
+# =========================================================
+# HISTORY STORAGE
+# =========================================================
 
 def load_history(local_only=True, github_cfg=None):
     if not local_only and github_cfg:
         df, sha, err = load_history_from_github(
-            github_cfg["owner"], github_cfg["repo"], github_cfg["path"], github_cfg["token"], branch=github_cfg["branch"]
+            github_cfg["owner"],
+            github_cfg["repo"],
+            github_cfg["path"],
+            github_cfg["token"],
+            branch=github_cfg["branch"],
         )
         return df, sha, err
+
     if LOCAL_HISTORY_CSV.exists():
         df = pd.read_csv(LOCAL_HISTORY_CSV)
     else:
         df = pd.DataFrame(columns=get_history_columns())
+
     for col in get_history_columns():
         if col not in df.columns:
             df[col] = None
+
     return df[get_history_columns()], None, None
 
 def save_history_local(df):
     df.to_csv(LOCAL_HISTORY_CSV, index=False)
 
-def append_results_to_history(results, session_label, timestamp, site_name, scanner_name, scanner_id, local_only=True, github_cfg=None, sha=None):
+def append_results_to_history(
+    results,
+    session_label,
+    timestamp,
+    site_name,
+    scanner_name,
+    scanner_id,
+    local_only=True,
+    github_cfg=None,
+    sha=None,
+):
     history, _, _ = load_history(local_only=local_only, github_cfg=github_cfg)
     rows = []
     for r in results:
-        rows.append({
-            "timestamp": timestamp,
-            "session_label": session_label,
-            "site_name": site_name,
-            "scanner_name": scanner_name,
-            "scanner_id": scanner_id,
-            "test_name": r["test_name"],
-            "value": r["value"],
-            "unit": r["unit"],
-            "criteria": r["criteria"],
-            "status": r["status"],
-            "details": r["details"],
-            "source_file": r.get("source_file", ""),
-        })
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "session_label": session_label,
+                "site_name": site_name,
+                "scanner_name": scanner_name,
+                "scanner_id": scanner_id,
+                "test_name": r["test_name"],
+                "value": r["value"],
+                "unit": r["unit"],
+                "criteria": r["criteria"],
+                "status": r["status"],
+                "details": r["details"],
+                "source_file": r.get("source_file", ""),
+            }
+        )
+
     updated = pd.concat([history, pd.DataFrame(rows)], ignore_index=True)
     updated["timestamp"] = updated["timestamp"].astype(str)
+
     if local_only:
         save_history_local(updated)
         return updated, None, None
-    ok, err = save_history_to_github(updated, github_cfg["owner"], github_cfg["repo"], github_cfg["path"], github_cfg["token"], branch=github_cfg["branch"], sha=sha)
+
+    ok, err = save_history_to_github(
+        updated,
+        github_cfg["owner"],
+        github_cfg["repo"],
+        github_cfg["path"],
+        github_cfg["token"],
+        branch=github_cfg["branch"],
+        sha=sha,
+    )
     return updated, ok, err
+
+def save_results_with_lock(
+    results,
+    session_label,
+    timestamp,
+    site_name,
+    scanner_name,
+    scanner_id,
+    local_only=True,
+    github_cfg=None,
+):
+    if local_only:
+        locked = acquire_local_lock()
+        if not locked:
+            return None, "Could not acquire local file lock. Please try again."
+        try:
+            updated, _, _ = append_results_to_history(
+                results,
+                session_label,
+                timestamp,
+                site_name,
+                scanner_name,
+                scanner_id,
+                local_only=True,
+                github_cfg=None,
+                sha=None,
+            )
+            return updated, None
+        finally:
+            release_local_lock()
+
+    ok, _, lock_err = acquire_github_lock(
+        github_cfg["owner"],
+        github_cfg["repo"],
+        github_cfg["path"],
+        github_cfg["token"],
+        branch=github_cfg["branch"],
+    )
+    if not ok:
+        return None, lock_err
+
+    try:
+        history_df, existing_sha, load_err = load_history(local_only=False, github_cfg=github_cfg)
+        if load_err:
+            return None, load_err
+
+        updated, _, save_err = append_results_to_history(
+            results,
+            session_label,
+            timestamp,
+            site_name,
+            scanner_name,
+            scanner_id,
+            local_only=False,
+            github_cfg=github_cfg,
+            sha=existing_sha,
+        )
+        if save_err:
+            return None, save_err
+
+        return updated, None
+    finally:
+        release_github_lock(
+            github_cfg["owner"],
+            github_cfg["repo"],
+            github_cfg["path"],
+            github_cfg["token"],
+            branch=github_cfg["branch"],
+        )
+
+# =========================================================
+# CHARTS / PDF
+# =========================================================
 
 def fig_to_rl_image(fig, width=500):
     buf = io.BytesIO()
@@ -319,8 +663,9 @@ def create_trend_chart(df, test_name):
     fig, ax = plt.subplots(figsize=(8, 4.2))
     ax.plot(sub["timestamp"], sub["value"], marker="o")
     ax.set_title(test_name)
+    unit = sub["unit"].dropna().iloc[0] if not sub["unit"].dropna().empty else ""
     ax.set_xlabel("Timestamp")
-    ax.set_ylabel(f"Value ({sub['unit'].dropna().iloc[0] if not sub['unit'].dropna().empty else ''})")
+    ax.set_ylabel(f"Value ({unit})")
     ax.grid(True, alpha=0.3)
     fig.autofmt_xdate()
 
@@ -328,9 +673,28 @@ def create_trend_chart(df, test_name):
     fig.savefig(chart_path, bbox_inches="tight", dpi=160)
     return fig, chart_path
 
+def add_reference_lines(ax, selected_test):
+    if selected_test == "Slice Thickness Accuracy":
+        ax.axhline(4.3, linestyle="--", alpha=0.7)
+        ax.axhline(5.7, linestyle="--", alpha=0.7)
+    elif selected_test == "Percentage Signal Ghosting":
+        ax.axhline(2.5, linestyle="--", alpha=0.7)
+    elif selected_test in ["Image Uniformity T1", "Image Uniformity T2"]:
+        ax.axhline(87.5, linestyle="--", alpha=0.7)
+    elif selected_test == "Geometric Accuracy":
+        ax.axhline(188, linestyle="--", alpha=0.7)
+        ax.axhline(192, linestyle="--", alpha=0.7)
+
 def build_pdf_report(results_df, history_df, site_name, scanner_name, session_label, timestamp_str):
     pdf_path = REPORTS_DIR / f"ACR_QC_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-    doc = SimpleDocTemplate(str(pdf_path), pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
     styles = getSampleStyleSheet()
     elements = []
 
@@ -352,14 +716,18 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
         table_data.append([row["test_name"], val, row["criteria"], row["status"]])
 
     table = Table(table_data, colWidths=[160, 90, 180, 70])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
-    ]))
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+            ]
+        )
+    )
     elements.append(table)
     elements.append(Spacer(1, 14))
 
@@ -373,7 +741,7 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
     added_any_chart = False
 
     for test_name in results_df["test_name"].tolist():
-        fig, chart_path = create_trend_chart(history_df, test_name)
+        fig, _ = create_trend_chart(history_df, test_name)
         if fig is not None:
             added_any_chart = True
             elements.append(Spacer(1, 6))
@@ -387,59 +755,103 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
     doc.build(elements)
     return pdf_path
 
+# =========================================================
+# UI
+# =========================================================
+
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Upload ACR MRI phantom test .txt files, auto-evaluate pass/fail, save history with timestamp, and generate a PDF report with trendlines.")
+st.caption(
+    "Upload ACR MRI phantom .txt files, auto-evaluate pass/fail, save history with timestamp, "
+    "and generate a PDF report with trendlines."
+)
+
+# Secrets-aware token
+try:
+    SECRET_GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+except Exception:
+    SECRET_GITHUB_TOKEN = ""
 
 with st.sidebar:
     st.header("Session info")
+
     site_name = st.text_input("Site / Hospital", value="My MRI Site")
-    scanner_name = st.text_input("Scanner / System", value="MRI Scanner")
+
+    # Preload scanners from GitHub if possible
+    preloaded_scanners = []
+    preload_error = None
+    auto_github_token = SECRET_GITHUB_TOKEN
+
+    if auto_github_token and DEFAULT_GITHUB_OWNER != "YOUR_GITHUB_USERNAME" and DEFAULT_GITHUB_REPO != "YOUR_REPO_NAME":
+        content, _, preload_error = github_get_file(
+            DEFAULT_GITHUB_OWNER,
+            DEFAULT_GITHUB_REPO,
+            DEFAULT_GITHUB_CSV_PATH,
+            auto_github_token,
+            branch=DEFAULT_GITHUB_BRANCH,
+        )
+        if content:
+            try:
+                preload_df = pd.read_csv(io.StringIO(content))
+                if "scanner_name" in preload_df.columns:
+                    preloaded_scanners = sorted(
+                        [x for x in preload_df["scanner_name"].dropna().astype(str).unique().tolist() if x]
+                    )
+            except Exception:
+                pass
+
+    if preloaded_scanners:
+        scanner_name = st.selectbox("Scanner / System", options=preloaded_scanners, index=0)
+    else:
+        scanner_name = st.text_input("Scanner / System", value="MRI Scanner")
+
     scanner_id = build_scanner_id(site_name, scanner_name)
     st.caption(f"System ID: {scanner_id}")
-    session_label = st.text_input("Session label", value=datetime.now().strftime("Monthly QC"))
+
+    session_label = st.text_input("Session label", value="Monthly QC")
     custom_timestamp = st.text_input("Timestamp (optional, ISO format)", value="")
     timestamp_str = custom_timestamp.strip() or datetime.now().isoformat(timespec="seconds")
 
+    st.header("Dashboard behavior")
+    default_to_current_scanner = st.checkbox("Default trend dashboard to current scanner", value=True)
+    group_history_by_scanner = st.checkbox("Group saved history tables by scanner", value=True)
+
     st.header("Persistence")
     storage_mode = st.radio("History storage", ["Local CSV", "GitHub CSV"], index=1)
-    github_owner = st.text_input("GitHub owner", value="")
-    github_repo = st.text_input("GitHub repository", value="")
-    github_branch = st.text_input("GitHub branch", value="main")
-    github_path = st.text_input("GitHub CSV path", value="acr_qc_data/acr_qc_history.csv")
-    st.caption("Tip: on Streamlit Cloud, store GITHUB_TOKEN in app secrets so you do not need to paste it here.")
-    secret_token = ""
-    try:
-        secret_token = st.secrets["GITHUB_TOKEN"]
-    except Exception:
-        secret_token = ""
 
-    if secret_token:
+    if SECRET_GITHUB_TOKEN:
         st.success("GitHub token loaded from Streamlit secrets.")
-        github_token = secret_token
+        github_token = SECRET_GITHUB_TOKEN
     else:
         github_token = st.text_input("GitHub token", value="", type="password")
 
+    github_owner = st.text_input("GitHub owner", value=DEFAULT_GITHUB_OWNER)
+    github_repo = st.text_input("GitHub repository", value=DEFAULT_GITHUB_REPO)
+    github_branch = st.text_input("GitHub branch", value=DEFAULT_GITHUB_BRANCH)
+    github_path = st.text_input("GitHub CSV path", value=DEFAULT_GITHUB_CSV_PATH)
+    st.caption("Tip: on Streamlit Cloud, store GITHUB_TOKEN in app secrets so you do not need to paste it here.")
 
-github_cfg = None
 use_github = storage_mode == "GitHub CSV"
+github_cfg = None
 if use_github:
     github_cfg = {
         "owner": github_owner.strip(),
         "repo": github_repo.strip(),
         "branch": github_branch.strip() or "main",
-        "path": github_path.strip() or "acr_qc_data/acr_qc_history.csv",
+        "path": github_path.strip() or DEFAULT_GITHUB_CSV_PATH,
         "token": github_token.strip(),
     }
 
 uploaded_files = st.file_uploader(
     "Upload the phantom .txt result files",
     type=["txt"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
 )
 
+parsed_results = []
+results_df = pd.DataFrame()
+
 if uploaded_files:
-    parsed_results = []
     with st.spinner("Parsing files..."):
         for uploaded_file in uploaded_files:
             text = read_text_file(uploaded_file)
@@ -448,101 +860,148 @@ if uploaded_files:
             parsed_results.append(result)
 
     results_df = pd.DataFrame(parsed_results)
+
     st.subheader("Current session results")
-    st.dataframe(results_df[["source_file", "test_name", "value", "unit", "criteria", "status", "details"]], use_container_width=True)
+    st.dataframe(
+        results_df[["source_file", "test_name", "value", "unit", "criteria", "status", "details"]],
+        use_container_width=True,
+    )
 
     overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
     st.metric("Overall session result", overall)
 
     col1, col2 = st.columns(2)
+
     with col1:
         if st.button("Save session to history", type="primary"):
             if use_github and not all([github_owner.strip(), github_repo.strip(), github_token.strip()]):
                 st.error("GitHub storage is selected, but owner, repository, or token is missing.")
             else:
-                existing_history, existing_sha, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
-                if load_err:
-                    st.error(load_err)
+                history_df, save_err = save_results_with_lock(
+                    parsed_results,
+                    session_label,
+                    timestamp_str,
+                    site_name,
+                    scanner_name,
+                    scanner_id,
+                    local_only=not use_github,
+                    github_cfg=github_cfg,
+                )
+                if save_err:
+                    st.error(save_err)
                 else:
-                    history_df, save_ok, save_err = append_results_to_history(
-                        parsed_results,
-                        session_label,
-                        timestamp_str,
-                        site_name,
-                        scanner_name,
-                        scanner_id,
-                        local_only=not use_github,
-                        github_cfg=github_cfg,
-                        sha=existing_sha
-                    )
-                    if save_err:
-                        st.error(save_err)
-                    else:
-                        st.success(f"Saved {len(parsed_results)} results to history for system: {scanner_id}")
+                    st.success(f"Saved {len(parsed_results)} results to history for system: {scanner_id}")
+
     with col2:
         if st.button("Generate PDF report"):
             history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
             if load_err:
                 st.error(load_err)
                 history_df = pd.DataFrame(columns=get_history_columns())
-            # Also include current unsaved session in temporary trend view
-            temp_history = pd.concat([
-                history_df,
-                pd.DataFrame([{
-                    "timestamp": timestamp_str,
-                    "session_label": session_label,
-                    "site_name": site_name,
-                    "scanner_name": scanner_name,
-                    "scanner_id": scanner_id,
-                    "test_name": r["test_name"],
-                    "value": r["value"],
-                    "unit": r["unit"],
-                    "criteria": r["criteria"],
-                    "status": r["status"],
-                    "details": r["details"],
-                    "source_file": r.get("source_file", ""),
-                } for r in parsed_results])
-            ], ignore_index=True)
 
-            pdf_path = build_pdf_report(results_df, temp_history, site_name, scanner_name, session_label, timestamp_str)
+            temp_history = pd.concat(
+                [
+                    history_df,
+                    pd.DataFrame(
+                        [
+                            {
+                                "timestamp": timestamp_str,
+                                "session_label": session_label,
+                                "site_name": site_name,
+                                "scanner_name": scanner_name,
+                                "scanner_id": scanner_id,
+                                "test_name": r["test_name"],
+                                "value": r["value"],
+                                "unit": r["unit"],
+                                "criteria": r["criteria"],
+                                "status": r["status"],
+                                "details": r["details"],
+                                "source_file": r.get("source_file", ""),
+                            }
+                            for r in parsed_results
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+            pdf_path = build_pdf_report(
+                results_df,
+                temp_history,
+                site_name,
+                scanner_name,
+                session_label,
+                timestamp_str,
+            )
+
             with open(pdf_path, "rb") as f:
-                st.download_button("Download PDF report", data=f.read(), file_name=pdf_path.name, mime="application/pdf")
+                st.download_button(
+                    "Download PDF report",
+                    data=f.read(),
+                    file_name=pdf_path.name,
+                    mime="application/pdf",
+                )
             st.success(f"PDF report created: {pdf_path}")
 
     st.subheader("Integrated trend dashboard")
+
     history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
     if load_err:
         st.error(load_err)
         history_df = pd.DataFrame(columns=get_history_columns())
+
     trend_source = history_df.copy()
     if not trend_source.empty:
         trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
 
-    # Include current session in displayed charts even before saving
-    current_rows = pd.DataFrame([{
-        "timestamp": timestamp_str,
-        "session_label": session_label,
-        "site_name": site_name,
-        "scanner_name": scanner_name,
-        "scanner_id": scanner_id,
-        "test_name": r["test_name"],
-        "value": r["value"],
-        "unit": r["unit"],
-        "criteria": r["criteria"],
-        "status": r["status"],
-        "details": r["details"],
-        "source_file": r.get("source_file", ""),
-    } for r in parsed_results])
+    current_rows = pd.DataFrame(
+        [
+            {
+                "timestamp": timestamp_str,
+                "session_label": session_label,
+                "site_name": site_name,
+                "scanner_name": scanner_name,
+                "scanner_id": scanner_id,
+                "test_name": r["test_name"],
+                "value": r["value"],
+                "unit": r["unit"],
+                "criteria": r["criteria"],
+                "status": r["status"],
+                "details": r["details"],
+                "source_file": r.get("source_file", ""),
+            }
+            for r in parsed_results
+        ]
+    )
+
     trend_source = pd.concat([trend_source, current_rows], ignore_index=True)
     trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
 
     if not trend_source.empty:
-        all_systems = sorted([x for x in trend_source["scanner_id"].dropna().astype(str).unique().tolist() if x])
-        selected_systems = st.multiselect("Systems to include", all_systems, default=[scanner_id] if scanner_id in all_systems else all_systems)
+        all_systems = sorted(
+            [x for x in trend_source["scanner_id"].dropna().astype(str).unique().tolist() if x]
+        )
+
+        detected_scanners = []
+        current_match = trend_source[
+            (trend_source["site_name"].astype(str) == str(site_name))
+            & (trend_source["scanner_name"].astype(str) == str(scanner_name))
+        ]
+        if not current_match.empty:
+            detected_scanners = sorted(current_match["scanner_id"].dropna().astype(str).unique().tolist())
+
+        default_systems = [scanner_id] if default_to_current_scanner and scanner_id in all_systems else all_systems
+        if detected_scanners and default_to_current_scanner:
+            default_systems = detected_scanners
+
+        selected_systems = st.multiselect("Systems to include", all_systems, default=default_systems)
         if selected_systems:
             trend_source = trend_source[trend_source["scanner_id"].isin(selected_systems)]
         else:
             trend_source = trend_source.iloc[0:0]
+
+        if detected_scanners:
+            st.caption("Detected matching scanner history: " + ", ".join(detected_scanners))
 
     if trend_source.empty:
         st.info("No trend data available yet.")
@@ -563,7 +1022,7 @@ if uploaded_files:
                 if not display_df.empty:
                     display_df["timestamp"] = pd.to_datetime(display_df["timestamp"], errors="coerce")
                     display_df = display_df.dropna(subset=["value"])
-                    if "selected_systems" in locals() and selected_systems:
+                    if selected_systems:
                         display_df = display_df[display_df["scanner_id"].isin(selected_systems)]
 
             test_df = display_df[display_df["test_name"] == selected_test].sort_values("timestamp")
@@ -574,39 +1033,95 @@ if uploaded_files:
                 mean_val = test_df["value"].mean()
                 min_val = test_df["value"].min()
                 max_val = test_df["value"].max()
+
                 metric_cols[0].metric("Latest", f"{latest:.3f}")
                 metric_cols[1].metric("Mean", f"{mean_val:.3f}")
                 metric_cols[2].metric("Min", f"{min_val:.3f}")
                 metric_cols[3].metric("Max", f"{max_val:.3f}")
 
-                fig, ax = plt.subplots(figsize=(8, 4.2))
-                ax.plot(test_df["timestamp"], test_df["value"], marker="o")
-                ax.set_title(selected_test)
-                unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
-                ax.set_xlabel("Timestamp")
-                ax.set_ylabel(f"Value ({unit})")
-                ax.grid(True, alpha=0.3)
+                systems_for_test = sorted(test_df["scanner_id"].dropna().astype(str).unique().tolist())
 
-                # Add simple reference lines where useful
-                if selected_test == "Slice Thickness Accuracy":
-                    ax.axhline(4.3, linestyle="--", alpha=0.7)
-                    ax.axhline(5.7, linestyle="--", alpha=0.7)
-                elif selected_test == "Percentage Signal Ghosting":
-                    ax.axhline(2.5, linestyle="--", alpha=0.7)
-                elif selected_test in ["Image Uniformity T1", "Image Uniformity T2"]:
-                    ax.axhline(87.5, linestyle="--", alpha=0.7)
-                elif selected_test == "Geometric Accuracy":
-                    ax.axhline(188, linestyle="--", alpha=0.7)
-                    ax.axhline(192, linestyle="--", alpha=0.7)
+                if len(systems_for_test) > 1:
+                    tabs = st.tabs(systems_for_test + ["Combined"])
 
-                fig.autofmt_xdate()
-                st.pyplot(fig)
-                plt.close(fig)
+                    for sys_name, tab in zip(systems_for_test, tabs[:-1]):
+                        with tab:
+                            sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp")
+                            fig, ax = plt.subplots(figsize=(8, 4.2))
+                            ax.plot(sys_df["timestamp"], sys_df["value"], marker="o")
+                            ax.set_title(f"{selected_test} | {sys_name}")
+                            unit = sys_df["unit"].dropna().iloc[0] if not sys_df["unit"].dropna().empty else ""
+                            ax.set_xlabel("Timestamp")
+                            ax.set_ylabel(f"Value ({unit})")
+                            ax.grid(True, alpha=0.3)
+                            add_reference_lines(ax, selected_test)
+                            fig.autofmt_xdate()
+                            st.pyplot(fig)
+                            plt.close(fig)
+
+                            st.dataframe(
+                                sys_df[
+                                    [
+                                        "timestamp",
+                                        "site_name",
+                                        "scanner_name",
+                                        "scanner_id",
+                                        "session_label",
+                                        "test_name",
+                                        "value",
+                                        "unit",
+                                        "status",
+                                        "details",
+                                    ]
+                                ],
+                                use_container_width=True,
+                            )
+
+                    with tabs[-1]:
+                        fig, ax = plt.subplots(figsize=(8, 4.2))
+                        for sys_name in systems_for_test:
+                            sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp")
+                            ax.plot(sys_df["timestamp"], sys_df["value"], marker="o", label=sys_name)
+                        ax.set_title(f"{selected_test} | Combined systems")
+                        unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
+                        ax.set_xlabel("Timestamp")
+                        ax.set_ylabel(f"Value ({unit})")
+                        ax.grid(True, alpha=0.3)
+                        ax.legend()
+                        add_reference_lines(ax, selected_test)
+                        fig.autofmt_xdate()
+                        st.pyplot(fig)
+                        plt.close(fig)
+                else:
+                    fig, ax = plt.subplots(figsize=(8, 4.2))
+                    ax.plot(test_df["timestamp"], test_df["value"], marker="o")
+                    ax.set_title(selected_test)
+                    unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
+                    ax.set_xlabel("Timestamp")
+                    ax.set_ylabel(f"Value ({unit})")
+                    ax.grid(True, alpha=0.3)
+                    add_reference_lines(ax, selected_test)
+                    fig.autofmt_xdate()
+                    st.pyplot(fig)
+                    plt.close(fig)
 
                 st.markdown("**Trend data table**")
                 st.dataframe(
-                    test_df[["timestamp", "site_name", "scanner_name", "scanner_id", "session_label", "test_name", "value", "unit", "status", "details"]],
-                    use_container_width=True
+                    test_df[
+                        [
+                            "timestamp",
+                            "site_name",
+                            "scanner_name",
+                            "scanner_id",
+                            "session_label",
+                            "test_name",
+                            "value",
+                            "unit",
+                            "status",
+                            "details",
+                        ]
+                    ],
+                    use_container_width=True,
                 )
 
                 trend_csv = test_df.to_csv(index=False).encode("utf-8")
@@ -614,7 +1129,7 @@ if uploaded_files:
                     "Download selected trend CSV",
                     data=trend_csv,
                     file_name=f"{selected_test.replace(' ', '_').replace('/', '_')}_trend.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
             else:
                 st.info("No numeric trend data yet for the selected test.")
@@ -623,24 +1138,42 @@ if uploaded_files:
         if history_df.empty:
             st.info("No saved history yet. Upload files and click 'Save session to history'.")
         else:
-            st.dataframe(history_df.sort_values(["scanner_id", "timestamp"], ascending=[True, True]), use_container_width=True)
+            sorted_history = history_df.sort_values(["scanner_id", "timestamp"], ascending=[True, True]).copy()
+            if group_history_by_scanner:
+                for sys_name in sorted(sorted_history["scanner_id"].dropna().astype(str).unique().tolist()):
+                    st.markdown(f"**Scanner: {sys_name}**")
+                    st.dataframe(sorted_history[sorted_history["scanner_id"] == sys_name], use_container_width=True)
+            else:
+                st.dataframe(sorted_history, use_container_width=True)
+
             csv_bytes = history_df.to_csv(index=False).encode("utf-8")
-            st.download_button("Download full history CSV", data=csv_bytes, file_name="acr_qc_history.csv", mime="text/csv")
+            st.download_button(
+                "Download full history CSV",
+                data=csv_bytes,
+                file_name="acr_qc_history.csv",
+                mime="text/csv",
+            )
 
 st.divider()
 st.subheader("History summary")
+
 history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
 if load_err:
     st.error(load_err)
     history_df = pd.DataFrame(columns=get_history_columns())
+
 if history_df.empty:
     st.info("No saved history yet.")
 else:
-    summary_df = history_df.groupby(["scanner_id", "site_name", "scanner_name", "test_name"], dropna=False).agg(
-        runs=("test_name", "count"),
-        pass_count=("status", lambda s: (s == "PASS").sum()),
-        fail_count=("status", lambda s: (s == "FAIL").sum()),
-        latest_value=("value", "last"),
-        latest_timestamp=("timestamp", "last"),
-    ).reset_index()
+    summary_df = (
+        history_df.groupby(["scanner_id", "site_name", "scanner_name", "test_name"], dropna=False)
+        .agg(
+            runs=("test_name", "count"),
+            pass_count=("status", lambda s: (s == "PASS").sum()),
+            fail_count=("status", lambda s: (s == "FAIL").sum()),
+            latest_value=("value", "last"),
+            latest_timestamp=("timestamp", "last"),
+        )
+        .reset_index()
+    )
     st.dataframe(summary_df, use_container_width=True)
