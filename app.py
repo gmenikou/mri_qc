@@ -43,6 +43,7 @@ DATA_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 CHARTS_DIR.mkdir(exist_ok=True)
 
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -806,7 +807,6 @@ try:
 except Exception:
     SECRET_GITHUB_TOKEN = ""
 
-use_github = True
 github_cfg = {
     "owner": DEFAULT_GITHUB_OWNER,
     "repo": DEFAULT_GITHUB_REPO,
@@ -819,13 +819,15 @@ session_saved = False
 parsed_results = []
 results_df = pd.DataFrame()
 
-history_df, _, preload_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+history_df, _, preload_err = load_history(local_only=False, github_cfg=github_cfg)
 if preload_err:
     st.error(preload_err)
     history_df = empty_history_df()
 
-known_sites = sorted([x for x in history_df["site_name"].dropna().astype(str).unique().tolist() if x])
-known_scanners = sorted([x for x in history_df["scanner_name"].dropna().astype(str).unique().tolist() if x])
+history_df["site_name"] = history_df["site_name"].fillna("").astype(str)
+history_df["scanner_name"] = history_df["scanner_name"].fillna("").astype(str)
+
+known_sites = sorted([x for x in history_df["site_name"].unique().tolist() if x])
 
 with st.sidebar:
     st.header("Session info")
@@ -839,10 +841,24 @@ with st.sidebar:
     else:
         site_name = st.text_input("Site / Hospital", value="")
 
-    if known_scanners:
+    filtered_scanners = []
+    if site_name.strip():
+        filtered_scanners = sorted(
+            [
+                x
+                for x in history_df.loc[history_df["site_name"] == site_name.strip(), "scanner_name"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+                if x
+            ]
+        )
+
+    if filtered_scanners:
         scanner_mode = st.radio("Scanner entry mode", ["Select existing", "Enter new"], horizontal=False)
         if scanner_mode == "Select existing":
-            scanner_name = st.selectbox("Scanner / System", options=known_scanners, index=0)
+            scanner_name = st.selectbox("Scanner / System", options=filtered_scanners, index=0)
         else:
             scanner_name = st.text_input("Scanner / System", value="")
     else:
@@ -966,10 +982,10 @@ if uploaded_files:
                 st.success(f"PDF report created: {pdf_path}")
 
 # =========================================================
-# TREND DASHBOARD
+# FRONT PAGE TRENDLINES
 # =========================================================
 
-st.subheader("Integrated trend dashboard")
+st.subheader("Front page history trendlines")
 
 history_df, _, load_err = load_history(local_only=False, github_cfg=github_cfg)
 if load_err:
@@ -1007,7 +1023,6 @@ trend_source = trend_source.drop_duplicates(
 
 if not trend_source.empty:
     trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
-
     all_systems = sorted(
         [x for x in trend_source["scanner_id"].dropna().astype(str).unique().tolist() if x]
     )
@@ -1031,8 +1046,46 @@ if not trend_source.empty:
     else:
         trend_source = trend_source.iloc[0:0]
 
-    if detected_scanners:
-        st.caption("Detected matching scanner history: " + ", ".join(detected_scanners))
+if trend_source.empty:
+    st.info("No trend data available yet.")
+else:
+    numeric_trend = trend_source.dropna(subset=["value"]).copy()
+    numeric_tests = sorted(numeric_trend["test_name"].dropna().unique().tolist())
+
+    if numeric_tests:
+        for test_name in numeric_tests:
+            test_df = numeric_trend[numeric_trend["test_name"] == test_name].copy().sort_values("timestamp")
+            if test_df.empty:
+                continue
+
+            st.markdown(f"### {test_name}")
+
+            systems_for_test = sorted(test_df["scanner_id"].dropna().astype(str).unique().tolist())
+
+            fig, ax = plt.subplots(figsize=(8, 4.0))
+            if len(systems_for_test) > 1:
+                for sys_name in systems_for_test:
+                    sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp")
+                    ax.plot(sys_df["timestamp"], sys_df["value"], marker="o", label=sys_name)
+                ax.legend()
+            else:
+                ax.plot(test_df["timestamp"], test_df["value"], marker="o")
+
+            unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
+            ax.set_title(test_name)
+            ax.set_xlabel("Timestamp")
+            ax.set_ylabel(f"Value ({unit})")
+            ax.grid(True, alpha=0.3)
+            add_reference_lines(ax, test_name)
+            fig.autofmt_xdate()
+            st.pyplot(fig)
+            plt.close(fig)
+
+# =========================================================
+# DETAILED TREND DASHBOARD
+# =========================================================
+
+st.subheader("Integrated trend dashboard")
 
 if trend_source.empty:
     st.info("No trend data available yet.")
