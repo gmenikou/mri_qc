@@ -25,9 +25,9 @@ from reportlab.platypus import (
 
 APP_TITLE = "ACR MRI Large Phantom QC Reporter"
 
-# -----------------------------
-# EDIT THESE 4 VALUES
-# -----------------------------
+# =========================================================
+# EDIT THESE ONCE
+# =========================================================
 DEFAULT_GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
 DEFAULT_GITHUB_REPO = "YOUR_REPO_NAME"
 DEFAULT_GITHUB_BRANCH = "main"
@@ -42,7 +42,6 @@ CHARTS_DIR = DATA_DIR / "charts"
 DATA_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
 CHARTS_DIR.mkdir(exist_ok=True)
-
 
 # =========================================================
 # HELPERS
@@ -86,6 +85,10 @@ def read_text_file(uploaded_file):
         except Exception:
             continue
     return raw.decode("utf-8", errors="ignore")
+
+
+def empty_history_df():
+    return pd.DataFrame(columns=get_history_columns())
 
 
 # =========================================================
@@ -349,15 +352,15 @@ def github_delete_file(owner, repo, path, token, message, branch="main", sha=Non
 def load_history_from_github(owner, repo, path, token, branch="main"):
     content, sha, err = github_get_file(owner, repo, path, token, branch=branch)
     if err:
-        return pd.DataFrame(columns=get_history_columns()), None, err
+        return empty_history_df(), None, err
 
     if content is None:
-        return pd.DataFrame(columns=get_history_columns()), None, None
+        return empty_history_df(), None, None
 
     try:
         df = pd.read_csv(io.StringIO(content))
     except Exception as e:
-        return pd.DataFrame(columns=get_history_columns()), None, f"Could not parse GitHub CSV: {e}"
+        return empty_history_df(), None, f"Could not parse GitHub CSV: {e}"
 
     for col in get_history_columns():
         if col not in df.columns:
@@ -490,7 +493,7 @@ def acquire_github_lock(owner, repo, csv_path, token, branch="main", timeout_sec
         )
 
         if ok:
-            latest_content, latest_sha, latest_err = github_get_file(owner, repo, lock_path, token, branch=branch)
+            _, latest_sha, latest_err = github_get_file(owner, repo, lock_path, token, branch=branch)
             if latest_err:
                 return False, None, latest_err
             return True, latest_sha, None
@@ -526,19 +529,18 @@ def release_github_lock(owner, repo, csv_path, token, branch="main"):
 
 def load_history(local_only=True, github_cfg=None):
     if not local_only and github_cfg:
-        df, sha, err = load_history_from_github(
+        return load_history_from_github(
             github_cfg["owner"],
             github_cfg["repo"],
             github_cfg["path"],
             github_cfg["token"],
             branch=github_cfg["branch"],
         )
-        return df, sha, err
 
     if LOCAL_HISTORY_CSV.exists():
         df = pd.read_csv(LOCAL_HISTORY_CSV)
     else:
-        df = pd.DataFrame(columns=get_history_columns())
+        df = empty_history_df()
 
     for col in get_history_columns():
         if col not in df.columns:
@@ -563,6 +565,7 @@ def append_results_to_history(
     sha=None,
 ):
     history, _, _ = load_history(local_only=local_only, github_cfg=github_cfg)
+
     rows = []
     for r in results:
         rows.append(
@@ -642,7 +645,7 @@ def save_results_with_lock(
         return None, lock_err
 
     try:
-        history_df, existing_sha, load_err = load_history(local_only=False, github_cfg=github_cfg)
+        _, existing_sha, load_err = load_history(local_only=False, github_cfg=github_cfg)
         if load_err:
             return None, load_err
 
@@ -803,37 +806,47 @@ try:
 except Exception:
     SECRET_GITHUB_TOKEN = ""
 
-preloaded_scanners = []
-if (
-    SECRET_GITHUB_TOKEN
-    and DEFAULT_GITHUB_OWNER != "YOUR_GITHUB_USERNAME"
-    and DEFAULT_GITHUB_REPO != "YOUR_REPO_NAME"
-):
-    content, _, _ = github_get_file(
-        DEFAULT_GITHUB_OWNER,
-        DEFAULT_GITHUB_REPO,
-        DEFAULT_GITHUB_CSV_PATH,
-        SECRET_GITHUB_TOKEN,
-        branch=DEFAULT_GITHUB_BRANCH,
-    )
-    if content:
-        try:
-            preload_df = pd.read_csv(io.StringIO(content))
-            if "scanner_name" in preload_df.columns:
-                preloaded_scanners = sorted(
-                    [x for x in preload_df["scanner_name"].dropna().astype(str).unique().tolist() if x]
-                )
-        except Exception:
-            pass
+use_github = True
+github_cfg = {
+    "owner": DEFAULT_GITHUB_OWNER,
+    "repo": DEFAULT_GITHUB_REPO,
+    "branch": DEFAULT_GITHUB_BRANCH,
+    "path": DEFAULT_GITHUB_CSV_PATH,
+    "token": SECRET_GITHUB_TOKEN,
+}
+
+session_saved = False
+parsed_results = []
+results_df = pd.DataFrame()
+
+history_df, _, preload_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+if preload_err:
+    st.error(preload_err)
+    history_df = empty_history_df()
+
+known_sites = sorted([x for x in history_df["site_name"].dropna().astype(str).unique().tolist() if x])
+known_scanners = sorted([x for x in history_df["scanner_name"].dropna().astype(str).unique().tolist() if x])
 
 with st.sidebar:
     st.header("Session info")
-    site_name = st.text_input("Site / Hospital", value="My MRI Site")
 
-    if preloaded_scanners:
-        scanner_name = st.selectbox("Scanner / System", options=preloaded_scanners, index=0)
+    if known_sites:
+        site_mode = st.radio("Site entry mode", ["Select existing", "Enter new"], horizontal=False)
+        if site_mode == "Select existing":
+            site_name = st.selectbox("Site / Hospital", options=known_sites, index=0)
+        else:
+            site_name = st.text_input("Site / Hospital", value="")
     else:
-        scanner_name = st.text_input("Scanner / System", value="MRI Scanner")
+        site_name = st.text_input("Site / Hospital", value="")
+
+    if known_scanners:
+        scanner_mode = st.radio("Scanner entry mode", ["Select existing", "Enter new"], horizontal=False)
+        if scanner_mode == "Select existing":
+            scanner_name = st.selectbox("Scanner / System", options=known_scanners, index=0)
+        else:
+            scanner_name = st.text_input("Scanner / System", value="")
+    else:
+        scanner_name = st.text_input("Scanner / System", value="")
 
     scanner_id = build_scanner_id(site_name, scanner_name)
     st.caption(f"System ID: {scanner_id}")
@@ -846,40 +859,16 @@ with st.sidebar:
     default_to_current_scanner = st.checkbox("Default trend dashboard to current scanner", value=True)
     group_history_by_scanner = st.checkbox("Group saved history tables by scanner", value=True)
 
-    st.header("Persistence")
-    storage_mode = st.radio("History storage", ["Local CSV", "GitHub CSV"], index=1)
-
     if SECRET_GITHUB_TOKEN:
         st.success("GitHub token loaded from Streamlit secrets.")
-        github_token = SECRET_GITHUB_TOKEN
     else:
-        github_token = st.text_input("GitHub token", value="", type="password")
-
-    github_owner = st.text_input("GitHub owner", value=DEFAULT_GITHUB_OWNER)
-    github_repo = st.text_input("GitHub repository", value=DEFAULT_GITHUB_REPO)
-    github_branch = st.text_input("GitHub branch", value=DEFAULT_GITHUB_BRANCH)
-    github_path = st.text_input("GitHub CSV path", value=DEFAULT_GITHUB_CSV_PATH)
-    st.caption("Tip: store GITHUB_TOKEN in Streamlit secrets so you do not need to paste it here.")
-
-use_github = storage_mode == "GitHub CSV"
-github_cfg = None
-if use_github:
-    github_cfg = {
-        "owner": github_owner.strip(),
-        "repo": github_repo.strip(),
-        "branch": github_branch.strip() or "main",
-        "path": github_path.strip() or DEFAULT_GITHUB_CSV_PATH,
-        "token": github_token.strip(),
-    }
+        st.error("Missing GITHUB_TOKEN in Streamlit secrets.")
 
 uploaded_files = st.file_uploader(
     "Upload the phantom .txt result files",
     type=["txt"],
     accept_multiple_files=True,
 )
-
-parsed_results = []
-results_df = pd.DataFrame()
 
 if uploaded_files:
     with st.spinner("Parsing files..."):
@@ -904,35 +893,36 @@ if uploaded_files:
 
     with col1:
         if st.button("Save session to history", type="primary"):
-            if use_github and not all([github_owner.strip(), github_repo.strip(), github_token.strip()]):
-                st.error("GitHub storage is selected, but owner, repository, or token is missing.")
+            if not SECRET_GITHUB_TOKEN:
+                st.error("Missing GitHub token in Streamlit secrets.")
+            elif not site_name.strip() or not scanner_name.strip():
+                st.error("Please enter both Site / Hospital and Scanner / System.")
             else:
-                history_df, save_err = save_results_with_lock(
+                history_after_save, save_err = save_results_with_lock(
                     parsed_results,
                     session_label,
                     timestamp_str,
                     site_name,
                     scanner_name,
                     scanner_id,
-                    local_only=not use_github,
+                    local_only=False,
                     github_cfg=github_cfg,
                 )
                 if save_err:
                     st.error(save_err)
                 else:
+                    session_saved = True
+                    history_df = history_after_save
                     st.success(f"Saved {len(parsed_results)} results to history for system: {scanner_id}")
 
     with col2:
         if st.button("Generate PDF report"):
-            history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
-            if load_err:
-                st.error(load_err)
-                history_df = pd.DataFrame(columns=get_history_columns())
-
-            temp_history = pd.concat(
-                [
-                    history_df,
-                    pd.DataFrame(
+            if not site_name.strip() or not scanner_name.strip():
+                st.error("Please enter both Site / Hospital and Scanner / System.")
+            else:
+                temp_history = history_df.copy()
+                if uploaded_files and parsed_results:
+                    current_rows = pd.DataFrame(
                         [
                             {
                                 "timestamp": timestamp_str,
@@ -950,46 +940,45 @@ if uploaded_files:
                             }
                             for r in parsed_results
                         ]
-                    ),
-                ],
-                ignore_index=True,
-            )
+                    )
+                    temp_history = pd.concat([temp_history, current_rows], ignore_index=True)
+                    temp_history = temp_history.drop_duplicates(
+                        subset=["timestamp", "scanner_id", "test_name", "value"],
+                        keep="first",
+                    )
 
-            pdf_path = build_pdf_report(
-                results_df,
-                temp_history,
-                site_name,
-                scanner_name,
-                session_label,
-                timestamp_str,
-            )
-
-            with open(pdf_path, "rb") as f:
-                st.download_button(
-                    "Download PDF report",
-                    data=f.read(),
-                    file_name=pdf_path.name,
-                    mime="application/pdf",
+                pdf_path = build_pdf_report(
+                    results_df,
+                    temp_history,
+                    site_name,
+                    scanner_name,
+                    session_label,
+                    timestamp_str,
                 )
-            st.success(f"PDF report created: {pdf_path}")
 
+                with open(pdf_path, "rb") as f:
+                    st.download_button(
+                        "Download PDF report",
+                        data=f.read(),
+                        file_name=pdf_path.name,
+                        mime="application/pdf",
+                    )
+                st.success(f"PDF report created: {pdf_path}")
 
 # =========================================================
-# TREND DASHBOARD ALWAYS VISIBLE
+# TREND DASHBOARD
 # =========================================================
 
 st.subheader("Integrated trend dashboard")
 
-history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+history_df, _, load_err = load_history(local_only=False, github_cfg=github_cfg)
 if load_err:
     st.error(load_err)
-    history_df = pd.DataFrame(columns=get_history_columns())
+    history_df = empty_history_df()
 
 trend_source = history_df.copy()
-if not trend_source.empty:
-    trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
 
-if uploaded_files and parsed_results:
+if uploaded_files and parsed_results and not session_saved:
     current_rows = pd.DataFrame(
         [
             {
@@ -1011,6 +1000,11 @@ if uploaded_files and parsed_results:
     )
     trend_source = pd.concat([trend_source, current_rows], ignore_index=True)
 
+trend_source = trend_source.drop_duplicates(
+    subset=["timestamp", "scanner_id", "test_name", "value"],
+    keep="first",
+)
+
 if not trend_source.empty:
     trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
 
@@ -1019,12 +1013,13 @@ if not trend_source.empty:
     )
 
     detected_scanners = []
-    current_match = trend_source[
-        (trend_source["site_name"].astype(str) == str(site_name))
-        & (trend_source["scanner_name"].astype(str) == str(scanner_name))
-    ]
-    if not current_match.empty:
-        detected_scanners = sorted(current_match["scanner_id"].dropna().astype(str).unique().tolist())
+    if site_name.strip() and scanner_name.strip():
+        current_match = trend_source[
+            (trend_source["site_name"].astype(str) == str(site_name))
+            & (trend_source["scanner_name"].astype(str) == str(scanner_name))
+        ]
+        if not current_match.empty:
+            detected_scanners = sorted(current_match["scanner_id"].dropna().astype(str).unique().tolist())
 
     default_systems = [scanner_id] if default_to_current_scanner and scanner_id in all_systems else all_systems
     if detected_scanners and default_to_current_scanner:
@@ -1193,10 +1188,10 @@ else:
 st.divider()
 st.subheader("History summary")
 
-history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+history_df, _, load_err = load_history(local_only=False, github_cfg=github_cfg)
 if load_err:
     st.error(load_err)
-    history_df = pd.DataFrame(columns=get_history_columns())
+    history_df = empty_history_df()
 
 if history_df.empty:
     st.info("No saved history yet.")
