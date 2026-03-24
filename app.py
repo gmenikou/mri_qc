@@ -1,0 +1,646 @@
+
+import re
+import io
+import json
+import base64
+import requests
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+
+APP_TITLE = "ACR MRI Large Phantom QC Reporter"
+DATA_DIR = Path("acr_qc_data")
+LOCAL_HISTORY_CSV = DATA_DIR / "acr_qc_history.csv"
+REPORTS_DIR = DATA_DIR / "reports"
+CHARTS_DIR = DATA_DIR / "charts"
+
+DATA_DIR.mkdir(exist_ok=True)
+REPORTS_DIR.mkdir(exist_ok=True)
+CHARTS_DIR.mkdir(exist_ok=True)
+
+TEST_MAP = {
+    "Slice Thickness": "Slice Thickness Accuracy",
+    "Position": "Slice Position Accuracy",
+    "SNR": "Signal to Noise Ratio",
+    "Ghosting": "Percentage Signal Ghosting",
+    "LCD": "Low Contrast Detectability",
+    "Image Uniformity T2": "Image Uniformity T2",
+    "Image Uniformity Test T1": "Image Uniformity T1",
+    "HCR-T2": "High Contrast Spatial Resolution T2",
+    "HCR-T1": "High Contrast Spatial Resolution T1",
+    "Geometric Accuracy": "Geometric Accuracy",
+    "Central Frequency": "Central Frequency",
+}
+
+def safe_float(text):
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+def read_text_file(uploaded_file):
+    raw = uploaded_file.read()
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+def parse_slice_thickness(text):
+    m = re.search(r"Slice thickness:\s*([0-9.\-]+)", text, re.I)
+    value = safe_float(m.group(1)) if m else None
+    passed = value is not None and 4.3 <= value <= 5.7
+    return {"test_name": "Slice Thickness Accuracy", "value": value, "unit": "mm",
+            "criteria": "4.3 to 5.7 mm", "status": "PASS" if passed else "FAIL",
+            "details": f"Measured slice thickness: {value} mm" if value is not None else "Could not parse"}
+
+def parse_slice_position(text):
+    m1 = re.search(r"Slice 1:\s*([0-9.\-]+)", text, re.I)
+    m11 = re.search(r"Slice 11:\s*([0-9.\-]+)", text, re.I)
+    v1 = safe_float(m1.group(1)) if m1 else None
+    v11 = safe_float(m11.group(1)) if m11 else None
+    passed = (v1 is not None and abs(v1) <= 5) and (v11 is not None and abs(v11) <= 5)
+    return {"test_name": "Slice Position Accuracy", "value": None, "unit": "mm",
+            "criteria": "Absolute value of Slice 1 and Slice 11 <= 5 mm", "status": "PASS" if passed else "FAIL",
+            "details": f"Slice 1: {v1} mm, Slice 11: {v11} mm"}
+
+def parse_snr(text):
+    m = re.search(r"SNR:\s*([0-9.\-]+)", text, re.I)
+    value = safe_float(m.group(1)) if m else None
+    # ACR generally trends SNR against baseline.
+    passed = value is not None
+    return {"test_name": "Signal to Noise Ratio", "value": value, "unit": "",
+            "criteria": "Compare to site baseline / trend", "status": "PASS" if passed else "FAIL",
+            "details": f"SNR: {value}" if value is not None else "Could not parse"}
+
+def parse_ghosting(text):
+    m = re.search(r"Ghosting Ratio calculated:\s*([0-9.\-]+)\s*%?", text, re.I)
+    value = safe_float(m.group(1)) if m else None
+    passed = value is not None and value <= 2.5
+    return {"test_name": "Percentage Signal Ghosting", "value": value, "unit": "%",
+            "criteria": "<= 2.5%", "status": "PASS" if passed else "FAIL",
+            "details": f"Ghosting ratio: {value}%" if value is not None else "Could not parse"}
+
+def parse_lcd(text):
+    t1 = re.search(r"Number of complete spokes in T1:\s*([0-9.\-]+)", text, re.I)
+    t2 = re.search(r"Number of complete spokes in T2:\s*([0-9.\-]+)", text, re.I)
+    v1 = safe_float(t1.group(1)) if t1 else None
+    v2 = safe_float(t2.group(1)) if t2 else None
+    # Threshold can vary by protocol/slice; 37 is commonly treated as strong performance.
+    passed = (v1 is not None and v1 >= 37) and (v2 is not None and v2 >= 37)
+    return {"test_name": "Low Contrast Detectability", "value": None, "unit": "spokes",
+            "criteria": "Site/ACR target threshold, commonly >= 37 for strong performance", "status": "PASS" if passed else "FAIL",
+            "details": f"T1 spokes: {v1}, T2 spokes: {v2}"}
+
+def parse_uniformity(text, modality_name):
+    m = re.search(r"Calculated PIU:\s*([0-9.\-]+)", text, re.I)
+    value = safe_float(m.group(1)) if m else None
+    passed = value is not None and value >= 87.5
+    return {"test_name": modality_name, "value": value, "unit": "%",
+            "criteria": ">= 87.5%", "status": "PASS" if passed else "FAIL",
+            "details": f"PIU: {value}%" if value is not None else "Could not parse"}
+
+def parse_hcr(text, modality_name):
+    upper = re.search(r"Upper hole size \[mm\]:\s*([0-9.\-]+)", text, re.I)
+    lower = re.search(r"Lower hole size \[mm\]:\s*([0-9.\-]+)", text, re.I)
+    up = safe_float(upper.group(1)) if upper else None
+    lo = safe_float(lower.group(1)) if lower else None
+    passed = (up is not None and up <= 1.0) and (lo is not None and lo <= 1.0)
+    return {"test_name": modality_name, "value": max([v for v in [up, lo] if v is not None], default=None), "unit": "mm",
+            "criteria": "Must resolve 1.0 mm holes", "status": "PASS" if passed else "FAIL",
+            "details": f"Upper: {up} mm, Lower: {lo} mm"}
+
+def parse_geometric(text):
+    nums = [safe_float(x) for x in re.findall(r"Length:\s*([0-9.\-]+)", text, re.I)]
+    nums = [x for x in nums if x is not None]
+    t1_values = [x for x in nums if 180 <= x <= 200]
+    passed = bool(t1_values) and all(188 <= x <= 192 for x in t1_values)
+    return {"test_name": "Geometric Accuracy", "value": sum(t1_values)/len(t1_values) if t1_values else None, "unit": "mm",
+            "criteria": "T1 dimensions should be 190 +/- 2 mm", "status": "PASS" if passed else "FAIL",
+            "details": f"T1 measurements: {t1_values}"}
+
+def parse_central_frequency(text):
+    m = re.search(r"Central Frequency .*?:\s*([0-9.\-]+)\s*MHz", text, re.I)
+    value = safe_float(m.group(1)) if m else None
+    passed = value is not None
+    return {"test_name": "Central Frequency", "value": value, "unit": "MHz",
+            "criteria": "Trend against system baseline", "status": "PASS" if passed else "FAIL",
+            "details": f"Central frequency: {value} MHz" if value is not None else "Could not parse"}
+
+def infer_parser(filename, text):
+    lower_name = filename.lower()
+    if "slice thickness" in lower_name:
+        return parse_slice_thickness(text)
+    if "position" in lower_name:
+        return parse_slice_position(text)
+    if "snr" in lower_name:
+        return parse_snr(text)
+    if "ghost" in lower_name:
+        return parse_ghosting(text)
+    if "lcd" in lower_name:
+        return parse_lcd(text)
+    if "uniformity" in lower_name and "t2" in lower_name:
+        return parse_uniformity(text, "Image Uniformity T2")
+    if "uniformity" in lower_name and "t1" in lower_name:
+        return parse_uniformity(text, "Image Uniformity T1")
+    if "hcr" in lower_name and "t2" in lower_name:
+        return parse_hcr(text, "High Contrast Spatial Resolution T2")
+    if "hcr" in lower_name and "t1" in lower_name:
+        return parse_hcr(text, "High Contrast Spatial Resolution T1")
+    if "geometric" in lower_name:
+        return parse_geometric(text)
+    if "central frequency" in lower_name:
+        return parse_central_frequency(text)
+
+    # Fallback by content
+    if "Slice Thickness Accuracy Test" in text:
+        return parse_slice_thickness(text)
+    if "Slice Position Accuracy Test" in text:
+        return parse_slice_position(text)
+    if "Signal to Noise Ratio Test" in text:
+        return parse_snr(text)
+    if "Percentage Signal Ghosting Test" in text:
+        return parse_ghosting(text)
+    if "Low Contrast Objective Detectability Test" in text:
+        return parse_lcd(text)
+    if "Image Intensity Uniformity Test" in text and "T2-weighted" in text:
+        return parse_uniformity(text, "Image Uniformity T2")
+    if "Image Intensity Uniformity Test" in text and "T1-weighted" in text:
+        return parse_uniformity(text, "Image Uniformity T1")
+    if "High Contrast Spatial Resolution Test" in text and "T2-weighted" in text:
+        return parse_hcr(text, "High Contrast Spatial Resolution T2")
+    if "High Contrast Spatial Resolution Test" in text and "T1-weighted" in text:
+        return parse_hcr(text, "High Contrast Spatial Resolution T1")
+    if "Geometric Accuracy Test" in text:
+        return parse_geometric(text)
+    if "Central Frequency Test" in text:
+        return parse_central_frequency(text)
+
+    return {"test_name": filename, "value": None, "unit": "", "criteria": "Unknown",
+            "status": "FAIL", "details": "No parser matched this file."}
+
+
+def github_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+def github_get_file(owner, repo, path, token, branch="main"):
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    resp = requests.get(url, headers=github_headers(token), params={"ref": branch}, timeout=30)
+    if resp.status_code == 200:
+        payload = resp.json()
+        content = base64.b64decode(payload["content"]).decode("utf-8")
+        return content, payload.get("sha"), None
+    if resp.status_code == 404:
+        return None, None, None
+    return None, None, f"GitHub read error {resp.status_code}: {resp.text}"
+
+def github_put_file(owner, repo, path, token, content_text, message, branch="main", sha=None):
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_text.encode("utf-8")).decode("utf-8"),
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha
+    resp = requests.put(url, headers=github_headers(token), json=payload, timeout=30)
+    if resp.status_code in (200, 201):
+        return True, None
+    return False, f"GitHub write error {resp.status_code}: {resp.text}"
+
+def get_history_columns():
+    return [
+        "timestamp", "session_label", "site_name", "scanner_name", "scanner_id",
+        "test_name", "value", "unit", "criteria", "status", "details", "source_file"
+    ]
+
+def load_history_from_github(owner, repo, path, token, branch="main"):
+    content, sha, err = github_get_file(owner, repo, path, token, branch=branch)
+    if err:
+        return pd.DataFrame(columns=get_history_columns()), None, err
+    if content is None:
+        return pd.DataFrame(columns=get_history_columns()), None, None
+    try:
+        df = pd.read_csv(io.StringIO(content))
+    except Exception as e:
+        return pd.DataFrame(columns=get_history_columns()), None, f"Could not parse GitHub CSV: {e}"
+    for col in get_history_columns():
+        if col not in df.columns:
+            df[col] = None
+    return df[get_history_columns()], sha, None
+
+def save_history_to_github(df, owner, repo, path, token, branch="main", sha=None):
+    csv_text = df.to_csv(index=False)
+    ok, err = github_put_file(
+        owner=owner,
+        repo=repo,
+        path=path,
+        token=token,
+        content_text=csv_text,
+        message="Update ACR QC history",
+        branch=branch,
+        sha=sha,
+    )
+    return ok, err
+
+def build_scanner_id(site_name, scanner_name):
+    raw = f"{site_name.strip()}__{scanner_name.strip()}".lower()
+    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    return raw or "unknown_scanner"
+
+def load_history(local_only=True, github_cfg=None):
+    if not local_only and github_cfg:
+        df, sha, err = load_history_from_github(
+            github_cfg["owner"], github_cfg["repo"], github_cfg["path"], github_cfg["token"], branch=github_cfg["branch"]
+        )
+        return df, sha, err
+    if LOCAL_HISTORY_CSV.exists():
+        df = pd.read_csv(LOCAL_HISTORY_CSV)
+    else:
+        df = pd.DataFrame(columns=get_history_columns())
+    for col in get_history_columns():
+        if col not in df.columns:
+            df[col] = None
+    return df[get_history_columns()], None, None
+
+def save_history_local(df):
+    df.to_csv(LOCAL_HISTORY_CSV, index=False)
+
+def append_results_to_history(results, session_label, timestamp, site_name, scanner_name, scanner_id, local_only=True, github_cfg=None, sha=None):
+    history, _, _ = load_history(local_only=local_only, github_cfg=github_cfg)
+    rows = []
+    for r in results:
+        rows.append({
+            "timestamp": timestamp,
+            "session_label": session_label,
+            "site_name": site_name,
+            "scanner_name": scanner_name,
+            "scanner_id": scanner_id,
+            "test_name": r["test_name"],
+            "value": r["value"],
+            "unit": r["unit"],
+            "criteria": r["criteria"],
+            "status": r["status"],
+            "details": r["details"],
+            "source_file": r.get("source_file", ""),
+        })
+    updated = pd.concat([history, pd.DataFrame(rows)], ignore_index=True)
+    updated["timestamp"] = updated["timestamp"].astype(str)
+    if local_only:
+        save_history_local(updated)
+        return updated, None, None
+    ok, err = save_history_to_github(updated, github_cfg["owner"], github_cfg["repo"], github_cfg["path"], github_cfg["token"], branch=github_cfg["branch"], sha=sha)
+    return updated, ok, err
+
+def fig_to_rl_image(fig, width=500):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
+    buf.seek(0)
+    return RLImage(buf, width=width, height=width * 0.58)
+
+def create_trend_chart(df, test_name):
+    sub = df[df["test_name"] == test_name].copy()
+    sub["timestamp"] = pd.to_datetime(sub["timestamp"], errors="coerce")
+    sub = sub.dropna(subset=["timestamp", "value"]).sort_values("timestamp")
+    if sub.empty:
+        return None, None
+
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    ax.plot(sub["timestamp"], sub["value"], marker="o")
+    ax.set_title(test_name)
+    ax.set_xlabel("Timestamp")
+    ax.set_ylabel(f"Value ({sub['unit'].dropna().iloc[0] if not sub['unit'].dropna().empty else ''})")
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+
+    chart_path = CHARTS_DIR / f"{test_name.replace('/', '_').replace(' ', '_')}.png"
+    fig.savefig(chart_path, bbox_inches="tight", dpi=160)
+    return fig, chart_path
+
+def build_pdf_report(results_df, history_df, site_name, scanner_name, session_label, timestamp_str):
+    pdf_path = REPORTS_DIR / f"ACR_QC_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    doc = SimpleDocTemplate(str(pdf_path), pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    elements.append(Paragraph("ACR MRI Large Phantom QC Compliance Report", styles["Title"]))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(f"<b>Site:</b> {site_name}", styles["Normal"]))
+    elements.append(Paragraph(f"<b>Scanner:</b> {scanner_name}", styles["Normal"]))
+    elements.append(Paragraph(f"<b>Session label:</b> {session_label}", styles["Normal"]))
+    elements.append(Paragraph(f"<b>Timestamp:</b> {timestamp_str}", styles["Normal"]))
+    elements.append(Spacer(1, 12))
+
+    overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
+    elements.append(Paragraph(f"<b>Overall result:</b> {overall}", styles["Heading2"]))
+    elements.append(Spacer(1, 8))
+
+    table_data = [["Test", "Value", "Criteria", "Status"]]
+    for _, row in results_df.iterrows():
+        val = "" if pd.isna(row["value"]) else f"{row['value']} {row['unit']}".strip()
+        table_data.append([row["test_name"], val, row["criteria"], row["status"]])
+
+    table = Table(table_data, colWidths=[160, 90, 180, 70])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 14))
+
+    elements.append(Paragraph("Parsed details", styles["Heading2"]))
+    for _, row in results_df.iterrows():
+        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["Normal"]))
+        elements.append(Spacer(1, 4))
+
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph("Trend charts", styles["Heading2"]))
+    added_any_chart = False
+
+    for test_name in results_df["test_name"].tolist():
+        fig, chart_path = create_trend_chart(history_df, test_name)
+        if fig is not None:
+            added_any_chart = True
+            elements.append(Spacer(1, 6))
+            elements.append(Paragraph(test_name, styles["Heading3"]))
+            elements.append(fig_to_rl_image(fig, width=500))
+            plt.close(fig)
+
+    if not added_any_chart:
+        elements.append(Paragraph("No historical numeric data yet for trend charts.", styles["Normal"]))
+
+    doc.build(elements)
+    return pdf_path
+
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+st.caption("Upload ACR MRI phantom test .txt files, auto-evaluate pass/fail, save history with timestamp, and generate a PDF report with trendlines.")
+
+with st.sidebar:
+    st.header("Session info")
+    site_name = st.text_input("Site / Hospital", value="My MRI Site")
+    scanner_name = st.text_input("Scanner / System", value="MRI Scanner")
+    scanner_id = build_scanner_id(site_name, scanner_name)
+    st.caption(f"System ID: {scanner_id}")
+    session_label = st.text_input("Session label", value=datetime.now().strftime("Monthly QC"))
+    custom_timestamp = st.text_input("Timestamp (optional, ISO format)", value="")
+    timestamp_str = custom_timestamp.strip() or datetime.now().isoformat(timespec="seconds")
+
+    st.header("Persistence")
+    storage_mode = st.radio("History storage", ["Local CSV", "GitHub CSV"], index=1)
+    github_owner = st.text_input("GitHub owner", value="")
+    github_repo = st.text_input("GitHub repository", value="")
+    github_branch = st.text_input("GitHub branch", value="main")
+    github_path = st.text_input("GitHub CSV path", value="acr_qc_data/acr_qc_history.csv")
+    st.caption("Tip: on Streamlit Cloud, store GITHUB_TOKEN in app secrets so you do not need to paste it here.")
+    secret_token = ""
+    try:
+        secret_token = st.secrets["GITHUB_TOKEN"]
+    except Exception:
+        secret_token = ""
+
+    if secret_token:
+        st.success("GitHub token loaded from Streamlit secrets.")
+        github_token = secret_token
+    else:
+        github_token = st.text_input("GitHub token", value="", type="password")
+
+
+github_cfg = None
+use_github = storage_mode == "GitHub CSV"
+if use_github:
+    github_cfg = {
+        "owner": github_owner.strip(),
+        "repo": github_repo.strip(),
+        "branch": github_branch.strip() or "main",
+        "path": github_path.strip() or "acr_qc_data/acr_qc_history.csv",
+        "token": github_token.strip(),
+    }
+
+uploaded_files = st.file_uploader(
+    "Upload the phantom .txt result files",
+    type=["txt"],
+    accept_multiple_files=True
+)
+
+if uploaded_files:
+    parsed_results = []
+    with st.spinner("Parsing files..."):
+        for uploaded_file in uploaded_files:
+            text = read_text_file(uploaded_file)
+            result = infer_parser(uploaded_file.name, text)
+            result["source_file"] = uploaded_file.name
+            parsed_results.append(result)
+
+    results_df = pd.DataFrame(parsed_results)
+    st.subheader("Current session results")
+    st.dataframe(results_df[["source_file", "test_name", "value", "unit", "criteria", "status", "details"]], use_container_width=True)
+
+    overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
+    st.metric("Overall session result", overall)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Save session to history", type="primary"):
+            if use_github and not all([github_owner.strip(), github_repo.strip(), github_token.strip()]):
+                st.error("GitHub storage is selected, but owner, repository, or token is missing.")
+            else:
+                existing_history, existing_sha, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+                if load_err:
+                    st.error(load_err)
+                else:
+                    history_df, save_ok, save_err = append_results_to_history(
+                        parsed_results,
+                        session_label,
+                        timestamp_str,
+                        site_name,
+                        scanner_name,
+                        scanner_id,
+                        local_only=not use_github,
+                        github_cfg=github_cfg,
+                        sha=existing_sha
+                    )
+                    if save_err:
+                        st.error(save_err)
+                    else:
+                        st.success(f"Saved {len(parsed_results)} results to history for system: {scanner_id}")
+    with col2:
+        if st.button("Generate PDF report"):
+            history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+            if load_err:
+                st.error(load_err)
+                history_df = pd.DataFrame(columns=get_history_columns())
+            # Also include current unsaved session in temporary trend view
+            temp_history = pd.concat([
+                history_df,
+                pd.DataFrame([{
+                    "timestamp": timestamp_str,
+                    "session_label": session_label,
+                    "site_name": site_name,
+                    "scanner_name": scanner_name,
+                    "scanner_id": scanner_id,
+                    "test_name": r["test_name"],
+                    "value": r["value"],
+                    "unit": r["unit"],
+                    "criteria": r["criteria"],
+                    "status": r["status"],
+                    "details": r["details"],
+                    "source_file": r.get("source_file", ""),
+                } for r in parsed_results])
+            ], ignore_index=True)
+
+            pdf_path = build_pdf_report(results_df, temp_history, site_name, scanner_name, session_label, timestamp_str)
+            with open(pdf_path, "rb") as f:
+                st.download_button("Download PDF report", data=f.read(), file_name=pdf_path.name, mime="application/pdf")
+            st.success(f"PDF report created: {pdf_path}")
+
+    st.subheader("Integrated trend dashboard")
+    history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+    if load_err:
+        st.error(load_err)
+        history_df = pd.DataFrame(columns=get_history_columns())
+    trend_source = history_df.copy()
+    if not trend_source.empty:
+        trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
+
+    # Include current session in displayed charts even before saving
+    current_rows = pd.DataFrame([{
+        "timestamp": timestamp_str,
+        "session_label": session_label,
+        "site_name": site_name,
+        "scanner_name": scanner_name,
+        "scanner_id": scanner_id,
+        "test_name": r["test_name"],
+        "value": r["value"],
+        "unit": r["unit"],
+        "criteria": r["criteria"],
+        "status": r["status"],
+        "details": r["details"],
+        "source_file": r.get("source_file", ""),
+    } for r in parsed_results])
+    trend_source = pd.concat([trend_source, current_rows], ignore_index=True)
+    trend_source["timestamp"] = pd.to_datetime(trend_source["timestamp"], errors="coerce")
+
+    if not trend_source.empty:
+        all_systems = sorted([x for x in trend_source["scanner_id"].dropna().astype(str).unique().tolist() if x])
+        selected_systems = st.multiselect("Systems to include", all_systems, default=[scanner_id] if scanner_id in all_systems else all_systems)
+        if selected_systems:
+            trend_source = trend_source[trend_source["scanner_id"].isin(selected_systems)]
+        else:
+            trend_source = trend_source.iloc[0:0]
+
+    if trend_source.empty:
+        st.info("No trend data available yet.")
+    else:
+        numeric_trend = trend_source.dropna(subset=["value"]).copy()
+        numeric_tests = sorted(numeric_trend["test_name"].dropna().unique().tolist())
+
+        if numeric_tests:
+            left, right = st.columns([2, 1])
+            with left:
+                selected_test = st.selectbox("Choose test for trend analysis", numeric_tests, index=0)
+            with right:
+                show_only_saved = st.checkbox("Only saved history", value=False)
+
+            display_df = numeric_trend.copy()
+            if show_only_saved:
+                display_df = history_df.copy()
+                if not display_df.empty:
+                    display_df["timestamp"] = pd.to_datetime(display_df["timestamp"], errors="coerce")
+                    display_df = display_df.dropna(subset=["value"])
+                    if "selected_systems" in locals() and selected_systems:
+                        display_df = display_df[display_df["scanner_id"].isin(selected_systems)]
+
+            test_df = display_df[display_df["test_name"] == selected_test].sort_values("timestamp")
+
+            metric_cols = st.columns(4)
+            if not test_df.empty:
+                latest = test_df.iloc[-1]["value"]
+                mean_val = test_df["value"].mean()
+                min_val = test_df["value"].min()
+                max_val = test_df["value"].max()
+                metric_cols[0].metric("Latest", f"{latest:.3f}")
+                metric_cols[1].metric("Mean", f"{mean_val:.3f}")
+                metric_cols[2].metric("Min", f"{min_val:.3f}")
+                metric_cols[3].metric("Max", f"{max_val:.3f}")
+
+                fig, ax = plt.subplots(figsize=(8, 4.2))
+                ax.plot(test_df["timestamp"], test_df["value"], marker="o")
+                ax.set_title(selected_test)
+                unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
+                ax.set_xlabel("Timestamp")
+                ax.set_ylabel(f"Value ({unit})")
+                ax.grid(True, alpha=0.3)
+
+                # Add simple reference lines where useful
+                if selected_test == "Slice Thickness Accuracy":
+                    ax.axhline(4.3, linestyle="--", alpha=0.7)
+                    ax.axhline(5.7, linestyle="--", alpha=0.7)
+                elif selected_test == "Percentage Signal Ghosting":
+                    ax.axhline(2.5, linestyle="--", alpha=0.7)
+                elif selected_test in ["Image Uniformity T1", "Image Uniformity T2"]:
+                    ax.axhline(87.5, linestyle="--", alpha=0.7)
+                elif selected_test == "Geometric Accuracy":
+                    ax.axhline(188, linestyle="--", alpha=0.7)
+                    ax.axhline(192, linestyle="--", alpha=0.7)
+
+                fig.autofmt_xdate()
+                st.pyplot(fig)
+                plt.close(fig)
+
+                st.markdown("**Trend data table**")
+                st.dataframe(
+                    test_df[["timestamp", "site_name", "scanner_name", "scanner_id", "session_label", "test_name", "value", "unit", "status", "details"]],
+                    use_container_width=True
+                )
+
+                trend_csv = test_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download selected trend CSV",
+                    data=trend_csv,
+                    file_name=f"{selected_test.replace(' ', '_').replace('/', '_')}_trend.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("No numeric trend data yet for the selected test.")
+
+        st.markdown("**All saved history**")
+        if history_df.empty:
+            st.info("No saved history yet. Upload files and click 'Save session to history'.")
+        else:
+            st.dataframe(history_df.sort_values(["scanner_id", "timestamp"], ascending=[True, True]), use_container_width=True)
+            csv_bytes = history_df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download full history CSV", data=csv_bytes, file_name="acr_qc_history.csv", mime="text/csv")
+
+st.divider()
+st.subheader("History summary")
+history_df, _, load_err = load_history(local_only=not use_github, github_cfg=github_cfg)
+if load_err:
+    st.error(load_err)
+    history_df = pd.DataFrame(columns=get_history_columns())
+if history_df.empty:
+    st.info("No saved history yet.")
+else:
+    summary_df = history_df.groupby(["scanner_id", "site_name", "scanner_name", "test_name"], dropna=False).agg(
+        runs=("test_name", "count"),
+        pass_count=("status", lambda s: (s == "PASS").sum()),
+        fail_count=("status", lambda s: (s == "FAIL").sum()),
+        latest_value=("value", "last"),
+        latest_timestamp=("timestamp", "last"),
+    ).reset_index()
+    st.dataframe(summary_df, use_container_width=True)
