@@ -30,8 +30,8 @@ from reportlab.platypus import (
 APP_TITLE = "ACR MRI Large Phantom QC Reporter"
 
 # Change these once for your deployment
-DEFAULT_GITHUB_OWNER = "YOUR_GITHUB_USERNAME"
-DEFAULT_GITHUB_REPO = "YOUR_REPO_NAME"
+DEFAULT_GITHUB_OWNER = "gmenikou"
+DEFAULT_GITHUB_REPO = "mri-qc"
 DEFAULT_GITHUB_BRANCH = "main"
 DEFAULT_GITHUB_CSV_PATH = "acr_qc_data/acr_qc_history.csv"
 
