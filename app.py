@@ -1110,7 +1110,8 @@ github_cfg = {
     "path": DEFAULT_GITHUB_CSV_PATH,
     "token": SECRET_GITHUB_TOKEN,
 }
-
+st.write("github_cfg =", github_cfg)
+st.write("github_is_ready =", github_is_ready(github_cfg))
 USE_GITHUB = github_is_ready(github_cfg)
 
 history_df, _, preload_err = cached_load_history(
