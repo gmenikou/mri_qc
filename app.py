@@ -1084,7 +1084,10 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
 # =========================================================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Upload ACR MRI phantom .txt files, auto-evaluate pass/fail, save history with timestamp, and generate a PDF report with trendlines.")
+st.caption(
+    "Upload ACR MRI phantom .txt files, auto-evaluate pass/fail, "
+    "save history with timestamp, and generate a PDF report with trendlines."
+)
 
 if "session_saved" not in st.session_state:
     st.session_state.session_saved = False
@@ -1307,7 +1310,7 @@ else:
         results_df = pd.DataFrame(combined_results)
 
 # =========================================================
-# OPTIONAL DETAILED PREVIEW DATA PREP
+# TREND DATA PREP
 # =========================================================
 history_df, _, load_err = cached_load_history(
     local_only=not USE_GITHUB,
@@ -1343,6 +1346,86 @@ if uploaded_files and combined_results and not st.session_state.session_saved:
     )
 
 front_trend_df = build_frontpage_trend_df(history_df, include_current_df=current_rows_df)
+
+# =========================================================
+# FRONT PAGE SYSTEM TREND PANEL
+# =========================================================
+st.subheader("System trend overview")
+
+if front_trend_df.empty:
+    st.info("No trend data available yet.")
+else:
+    system_options = sorted(front_trend_df["scanner_id"].dropna().astype(str).unique().tolist())
+
+    default_idx = 0
+    if default_to_current_scanner and scanner_id in system_options:
+        default_idx = system_options.index(scanner_id)
+
+    selected_system = st.selectbox(
+        "Select system",
+        system_options,
+        index=default_idx,
+        key="front_system_overview_select",
+    )
+
+    system_df = front_trend_df[front_trend_df["scanner_id"] == selected_system].copy()
+    system_df = system_df.sort_values(["test_name", "timestamp_dt"])
+
+    if system_df.empty:
+        st.warning("No data available for this system.")
+    else:
+        test_names = sorted(system_df["test_name"].dropna().astype(str).unique().tolist())
+
+        for test_name in test_names:
+            test_df = system_df[system_df["test_name"] == test_name].copy().sort_values("timestamp_dt")
+            test_df = test_df.dropna(subset=["value", "timestamp_dt"])
+
+            if test_df.empty:
+                continue
+
+            st.markdown(f"### {test_name}")
+
+            latest = test_df.iloc[-1]["value"]
+            mean_val = test_df["value"].mean()
+            min_val = test_df["value"].min()
+            max_val = test_df["value"].max()
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Latest", f"{latest:.3f}")
+            m2.metric("Mean", f"{mean_val:.3f}")
+            m3.metric("Min", f"{min_val:.3f}")
+            m4.metric("Max", f"{max_val:.3f}")
+
+            fig, ax = plt.subplots(figsize=(9, 4.0))
+            ax.plot(test_df["timestamp_dt"], test_df["value"], marker="o")
+            unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
+            ax.set_title(f"{test_name} | {selected_system}")
+            ax.set_xlabel("Timestamp")
+            ax.set_ylabel(f"Value ({unit})")
+            ax.grid(True, alpha=0.3)
+            add_reference_lines(ax, test_name)
+            fig.autofmt_xdate()
+            st.pyplot(fig)
+            plt.close(fig)
+
+            with st.expander(f"Show data table for {test_name}"):
+                st.dataframe(
+                    test_df[
+                        [
+                            "timestamp",
+                            "site_name",
+                            "scanner_name",
+                            "scanner_id",
+                            "session_label",
+                            "test_name",
+                            "value",
+                            "unit",
+                            "status",
+                            "details",
+                        ]
+                    ],
+                    use_container_width=True,
+                )
 
 # =========================================================
 # DETAILED PREVIEW
