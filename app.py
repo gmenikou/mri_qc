@@ -1103,11 +1103,13 @@ try:
 except Exception:
     SECRET_GITHUB_TOKEN = ""
 
+repo_full = st.secrets["GITHUB_REPO"]  # "gmenikou/mri-qc"
+owner, repo_name = repo_full.split("/", 1)
 github_cfg = {
-    "owner": DEFAULT_GITHUB_OWNER,
-    "repo": DEFAULT_GITHUB_REPO,
-    "branch": DEFAULT_GITHUB_BRANCH,
-    "path": DEFAULT_GITHUB_CSV_PATH,
+    "owner": owner,
+    "repo": repo_name,
+    "branch": st.secrets["GITHUB_BRANCH"],
+    "path": DEFAULT_GITHUB_CSV_PATH,  # αυτό μπορεί να μείνει
     "token": SECRET_GITHUB_TOKEN,
 }
 st.write("github_cfg =", github_cfg)
