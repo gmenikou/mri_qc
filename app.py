@@ -374,15 +374,22 @@ def parse_slice_thickness(text):
 
 
 def parse_slice_position(text):
-    m1 = re.search(r"Slice 1:\s*([0-9.\-]+)", text, re.I)
-    m11 = re.search(r"Slice 11:\s*([0-9.\-]+)", text, re.I)
+    m1 = re.search(r"Slice\s*1\s*:\s*([-+]?\d+(?:\.\d+)?)", text, re.I)
+    m11 = re.search(r"Slice\s*11\s*:\s*([-+]?\d+(?:\.\d+)?)", text, re.I)
+
     v1 = safe_float(m1.group(1)) if m1 else None
     v11 = safe_float(m11.group(1)) if m11 else None
 
     candidates = [x for x in [v1, v11] if x is not None]
     worst_abs = max([abs(x) for x in candidates], default=None)
 
-    passed = (v1 is not None and abs(v1) <= 5) and (v11 is not None and abs(v11) <= 5)
+    passed = (
+        v1 is not None
+        and v11 is not None
+        and abs(v1) <= 5
+        and abs(v11) <= 5
+    )
+
     return {
         "test_name": "Slice Position Accuracy",
         "value": worst_abs,
@@ -511,29 +518,7 @@ def parse_central_frequency(text):
 def infer_parser(filename, text):
     lower_name = filename.lower()
 
-    if "slice thickness" in lower_name:
-        return parse_slice_thickness(text)
-    if "position" in lower_name:
-        return parse_slice_position(text)
-    if "snr" in lower_name:
-        return parse_snr(text)
-    if "ghost" in lower_name:
-        return parse_ghosting(text)
-    if "lcd" in lower_name:
-        return parse_lcd(text)
-    if "uniformity" in lower_name and "t2" in lower_name:
-        return parse_uniformity(text, "Image Uniformity T2")
-    if "uniformity" in lower_name and "t1" in lower_name:
-        return parse_uniformity(text, "Image Uniformity T1")
-    if "hcr" in lower_name and "t2" in lower_name:
-        return parse_hcr(text, "High Contrast Spatial Resolution T2")
-    if "hcr" in lower_name and "t1" in lower_name:
-        return parse_hcr(text, "High Contrast Spatial Resolution T1")
-    if "geometric" in lower_name:
-        return parse_geometric(text)
-    if "central frequency" in lower_name:
-        return parse_central_frequency(text)
-
+    # Prefer content-based detection first
     if "Slice Thickness Accuracy Test" in text:
         return parse_slice_thickness(text)
     if "Slice Position Accuracy Test" in text:
@@ -555,6 +540,30 @@ def infer_parser(filename, text):
     if "Geometric Accuracy Test" in text:
         return parse_geometric(text)
     if "Central Frequency Test" in text:
+        return parse_central_frequency(text)
+
+    # Fallback to filename-based detection
+    if "slice thickness" in lower_name:
+        return parse_slice_thickness(text)
+    if "position" in lower_name:
+        return parse_slice_position(text)
+    if "snr" in lower_name:
+        return parse_snr(text)
+    if "ghost" in lower_name:
+        return parse_ghosting(text)
+    if "lcd" in lower_name:
+        return parse_lcd(text)
+    if "uniformity" in lower_name and "t2" in lower_name:
+        return parse_uniformity(text, "Image Uniformity T2")
+    if "uniformity" in lower_name and "t1" in lower_name:
+        return parse_uniformity(text, "Image Uniformity T1")
+    if "hcr" in lower_name and "t2" in lower_name:
+        return parse_hcr(text, "High Contrast Spatial Resolution T2")
+    if "hcr" in lower_name and "t1" in lower_name:
+        return parse_hcr(text, "High Contrast Spatial Resolution T1")
+    if "geometric" in lower_name:
+        return parse_geometric(text)
+    if "central frequency" in lower_name:
         return parse_central_frequency(text)
 
     return {
@@ -1177,11 +1186,6 @@ with st.sidebar:
     custom_timestamp = st.text_input("Timestamp (optional, ISO format)", value="")
     timestamp_str = custom_timestamp.strip() or datetime.now().isoformat(timespec="seconds")
 
-    st.header("Dashboard behavior")
-    default_to_current_scanner = st.checkbox("Default trend dashboard to current scanner", value=True)
-    group_history_by_scanner = st.checkbox("Group saved history tables by scanner", value=True)
-    show_detailed_preview = st.checkbox("Show detailed preview", value=False)
-
     if USE_GITHUB:
         st.success("GitHub history storage is active.")
     else:
@@ -1221,14 +1225,6 @@ if uploaded_files:
 
     overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
     st.metric("Overall session result", overall)
-
-    with st.expander("Show raw parsed per-file results"):
-        raw_df = pd.DataFrame(parsed_results)
-        if not raw_df.empty:
-            st.dataframe(
-                raw_df[["source_file", "sequence_label", "test_name", "value", "unit", "criteria", "status", "details"]],
-                use_container_width=True,
-            )
 
     col1, col2 = st.columns(2)
 
@@ -1348,262 +1344,91 @@ if uploaded_files and combined_results and not st.session_state.session_saved:
 front_trend_df = build_frontpage_trend_df(history_df, include_current_df=current_rows_df)
 
 # =========================================================
-# FRONT PAGE SYSTEM TREND PANEL
+# FRONT PAGE SINGLE TREND PANEL
 # =========================================================
-st.subheader("System trend overview")
+st.subheader("Trend preview")
 
 if front_trend_df.empty:
     st.info("No trend data available yet.")
 else:
+    panel_col1, panel_col2 = st.columns(2)
+
     system_options = sorted(front_trend_df["scanner_id"].dropna().astype(str).unique().tolist())
 
-    default_idx = 0
-    if default_to_current_scanner and scanner_id in system_options:
-        default_idx = system_options.index(scanner_id)
+    with panel_col1:
+        default_idx = 0
+        if scanner_id in system_options:
+            default_idx = system_options.index(scanner_id)
 
-    selected_system = st.selectbox(
-        "Select system",
-        system_options,
-        index=default_idx,
-        key="front_system_overview_select",
-    )
+        selected_system = st.selectbox(
+            "Select system",
+            system_options,
+            index=default_idx,
+            key="front_system_select",
+        )
 
     system_df = front_trend_df[front_trend_df["scanner_id"] == selected_system].copy()
-    system_df = system_df.sort_values(["test_name", "timestamp_dt"])
+    test_options = sorted(system_df["test_name"].dropna().astype(str).unique().tolist())
 
-    if system_df.empty:
-        st.warning("No data available for this system.")
-    else:
-        test_names = sorted(system_df["test_name"].dropna().astype(str).unique().tolist())
-
-        for test_name in test_names:
-            test_df = system_df[system_df["test_name"] == test_name].copy().sort_values("timestamp_dt")
-            test_df = test_df.dropna(subset=["value", "timestamp_dt"])
-
-            if test_df.empty:
-                continue
-
-            st.markdown(f"### {test_name}")
-
-            latest = test_df.iloc[-1]["value"]
-            mean_val = test_df["value"].mean()
-            min_val = test_df["value"].min()
-            max_val = test_df["value"].max()
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Latest", f"{latest:.3f}")
-            m2.metric("Mean", f"{mean_val:.3f}")
-            m3.metric("Min", f"{min_val:.3f}")
-            m4.metric("Max", f"{max_val:.3f}")
-
-            fig, ax = plt.subplots(figsize=(9, 4.0))
-            ax.plot(test_df["timestamp_dt"], test_df["value"], marker="o")
-            unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
-            ax.set_title(f"{test_name} | {selected_system}")
-            ax.set_xlabel("Timestamp")
-            ax.set_ylabel(f"Value ({unit})")
-            ax.grid(True, alpha=0.3)
-            add_reference_lines(ax, test_name)
-            fig.autofmt_xdate()
-            st.pyplot(fig)
-            plt.close(fig)
-
-            with st.expander(f"Show data table for {test_name}"):
-                st.dataframe(
-                    test_df[
-                        [
-                            "timestamp",
-                            "site_name",
-                            "scanner_name",
-                            "scanner_id",
-                            "session_label",
-                            "test_name",
-                            "value",
-                            "unit",
-                            "status",
-                            "details",
-                        ]
-                    ],
-                    use_container_width=True,
-                )
-
-# =========================================================
-# DETAILED PREVIEW
-# =========================================================
-if show_detailed_preview:
-    st.subheader("Integrated trend dashboard")
-
-    trend_source = build_frontpage_trend_df(history_df, include_current_df=current_rows_df)
-
-    if trend_source.empty:
-        st.info("No trend data available yet.")
-    else:
-        numeric_tests = sorted(trend_source["test_name"].dropna().unique().tolist())
-
-        if numeric_tests:
-            left, right = st.columns([2, 1])
-            with left:
-                selected_test = st.selectbox("Choose test for trend analysis", numeric_tests, index=0, key="dashboard_test")
-            with right:
-                show_only_saved = st.checkbox("Only saved history", value=False)
-
-            display_df = trend_source.copy()
-            if show_only_saved:
-                display_df = build_frontpage_trend_df(history_df)
-
-            test_df = display_df[display_df["test_name"] == selected_test].sort_values("timestamp_dt")
-
-            metric_cols = st.columns(4)
-            if not test_df.empty:
-                latest = test_df.iloc[-1]["value"]
-                mean_val = test_df["value"].mean()
-                min_val = test_df["value"].min()
-                max_val = test_df["value"].max()
-
-                metric_cols[0].metric("Latest", f"{latest:.3f}")
-                metric_cols[1].metric("Mean", f"{mean_val:.3f}")
-                metric_cols[2].metric("Min", f"{min_val:.3f}")
-                metric_cols[3].metric("Max", f"{max_val:.3f}")
-
-                systems_for_test = sorted(test_df["scanner_id"].dropna().astype(str).unique().tolist())
-
-                if len(systems_for_test) > 1:
-                    tabs = st.tabs(systems_for_test + ["Combined"])
-
-                    for sys_name, tab in zip(systems_for_test, tabs[:-1]):
-                        with tab:
-                            sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp_dt")
-                            fig, ax = plt.subplots(figsize=(8, 4.2))
-                            ax.plot(sys_df["timestamp_dt"], sys_df["value"], marker="o")
-                            ax.set_title(f"{selected_test} | {sys_name}")
-                            unit = sys_df["unit"].dropna().iloc[0] if not sys_df["unit"].dropna().empty else ""
-                            ax.set_xlabel("Timestamp")
-                            ax.set_ylabel(f"Value ({unit})")
-                            ax.grid(True, alpha=0.3)
-                            add_reference_lines(ax, selected_test)
-                            fig.autofmt_xdate()
-                            st.pyplot(fig)
-                            plt.close(fig)
-
-                            st.dataframe(
-                                sys_df[
-                                    [
-                                        "timestamp",
-                                        "site_name",
-                                        "scanner_name",
-                                        "scanner_id",
-                                        "session_label",
-                                        "test_name",
-                                        "value",
-                                        "unit",
-                                        "status",
-                                        "details",
-                                    ]
-                                ],
-                                use_container_width=True,
-                            )
-
-                    with tabs[-1]:
-                        fig, ax = plt.subplots(figsize=(8, 4.2))
-                        for sys_name in systems_for_test:
-                            sys_df = test_df[test_df["scanner_id"] == sys_name].copy().sort_values("timestamp_dt")
-                            ax.plot(sys_df["timestamp_dt"], sys_df["value"], marker="o", label=sys_name)
-                        ax.set_title(f"{selected_test} | Combined systems")
-                        unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
-                        ax.set_xlabel("Timestamp")
-                        ax.set_ylabel(f"Value ({unit})")
-                        ax.grid(True, alpha=0.3)
-                        ax.legend()
-                        add_reference_lines(ax, selected_test)
-                        fig.autofmt_xdate()
-                        st.pyplot(fig)
-                        plt.close(fig)
-                else:
-                    fig, ax = plt.subplots(figsize=(8, 4.2))
-                    ax.plot(test_df["timestamp_dt"], test_df["value"], marker="o")
-                    ax.set_title(selected_test)
-                    unit = test_df["unit"].dropna().iloc[0] if not test_df["unit"].dropna().empty else ""
-                    ax.set_xlabel("Timestamp")
-                    ax.set_ylabel(f"Value ({unit})")
-                    ax.grid(True, alpha=0.3)
-                    add_reference_lines(ax, selected_test)
-                    fig.autofmt_xdate()
-                    st.pyplot(fig)
-                    plt.close(fig)
-
-                st.markdown("**Trend data table**")
-                st.dataframe(
-                    test_df[
-                        [
-                            "timestamp",
-                            "site_name",
-                            "scanner_name",
-                            "scanner_id",
-                            "session_label",
-                            "test_name",
-                            "value",
-                            "unit",
-                            "status",
-                            "details",
-                        ]
-                    ],
-                    use_container_width=True,
-                )
-
-                trend_csv = test_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download selected trend CSV",
-                    data=trend_csv,
-                    file_name=f"{selected_test.replace(' ', '_').replace('/', '_')}_trend.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.info("No numeric trend data yet for the selected test.")
-
-        st.markdown("**All saved history**")
-        if history_df.empty:
-            st.info("No saved history yet. Upload files and click 'Save session to history'.")
-        else:
-            sorted_history = history_df.copy()
-            sorted_history["timestamp_dt"] = pd.to_datetime(sorted_history["timestamp"], errors="coerce")
-            sorted_history = sorted_history.sort_values(["scanner_id", "timestamp_dt"], ascending=[True, True]).drop(columns=["timestamp_dt"])
-
-            if group_history_by_scanner:
-                for sys_name in sorted(sorted_history["scanner_id"].dropna().astype(str).unique().tolist()):
-                    st.markdown(f"**Scanner: {sys_name}**")
-                    st.dataframe(sorted_history[sorted_history["scanner_id"] == sys_name], use_container_width=True)
-            else:
-                st.dataframe(sorted_history, use_container_width=True)
-
-            csv_bytes = history_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download full history CSV",
-                data=csv_bytes,
-                file_name="acr_qc_history.csv",
-                mime="text/csv",
-            )
-
-    st.divider()
-    st.subheader("History summary")
-
-    summary_source = build_frontpage_trend_df(history_df)
-
-    if summary_source.empty:
-        st.info("No saved history yet.")
-    else:
-        summary_source = summary_source.sort_values(
-            ["scanner_id", "site_name", "scanner_name", "test_name", "timestamp_dt"]
-        ).copy()
-
-        summary_df = (
-            summary_source.groupby(["scanner_id", "site_name", "scanner_name", "test_name"], dropna=False)
-            .agg(
-                runs=("test_name", "count"),
-                pass_count=("status", lambda s: (s == "PASS").sum()),
-                fail_count=("status", lambda s: (s == "FAIL").sum()),
-                latest_value=("value", "last"),
-                latest_timestamp=("timestamp", "last"),
-            )
-            .reset_index()
+    with panel_col2:
+        selected_test = st.selectbox(
+            "Select test",
+            test_options,
+            key="front_test_select",
         )
-        st.dataframe(summary_df, use_container_width=True)
+
+    plot_df = system_df[system_df["test_name"] == selected_test].copy().sort_values("timestamp_dt")
+    plot_df = plot_df.dropna(subset=["timestamp_dt", "value"])
+
+    if plot_df.empty:
+        st.warning("No data available for this selection.")
+    else:
+        latest = plot_df.iloc[-1]["value"]
+        mean_val = plot_df["value"].mean()
+        min_val = plot_df["value"].min()
+        max_val = plot_df["value"].max()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Latest", f"{latest:.3f}")
+        m2.metric("Mean", f"{mean_val:.3f}")
+        m3.metric("Min", f"{min_val:.3f}")
+        m4.metric("Max", f"{max_val:.3f}")
+
+        fig, ax = plt.subplots(figsize=(9, 4.2))
+        ax.plot(plot_df["timestamp_dt"], plot_df["value"], marker="o")
+        unit = plot_df["unit"].dropna().iloc[0] if not plot_df["unit"].dropna().empty else ""
+        ax.set_title(f"{selected_test} | {selected_system}")
+        ax.set_xlabel("Timestamp")
+        ax.set_ylabel(f"Value ({unit})")
+        ax.grid(True, alpha=0.3)
+        add_reference_lines(ax, selected_test)
+        fig.autofmt_xdate()
+        st.pyplot(fig)
+        plt.close(fig)
+
+        with st.expander("Show trend data table"):
+            st.dataframe(
+                plot_df[
+                    [
+                        "timestamp",
+                        "site_name",
+                        "scanner_name",
+                        "scanner_id",
+                        "session_label",
+                        "test_name",
+                        "value",
+                        "unit",
+                        "status",
+                        "details",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+        csv_bytes = plot_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download trend CSV",
+            data=csv_bytes,
+            file_name=f"{selected_test}_{selected_system}_trend.csv".replace(" ", "_").replace("/", "_"),
+            mime="text/csv",
+        )
