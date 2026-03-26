@@ -11,26 +11,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import streamlit as st
-
-import requests
-
-token = st.secrets["GITHUB_TOKEN"]
-repo = st.secrets["GITHUB_REPO"]
-
-headers = {
-    "Authorization": f"Bearer {token}",
-    "Accept": "application/vnd.github+json"
-}
-
-user_resp = requests.get("https://api.github.com/user", headers=headers)
-repo_resp = requests.get(f"https://api.github.com/repos/{repo}", headers=headers)
-
-st.write("User status:", user_resp.status_code)
-st.write("Repo status:", repo_resp.status_code)
-
-st.write("User response:", user_resp.json())
-st.write("Repo response:", repo_resp.json())
-
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
