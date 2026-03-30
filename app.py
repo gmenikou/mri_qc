@@ -592,7 +592,6 @@ def parse_central_frequency(text):
 def infer_parser(filename, text):
     lower_name = filename.lower()
 
-    # Prefer content-based detection first
     if "Slice Thickness Accuracy Test" in text:
         return parse_slice_thickness(text)
     if "Slice Position Accuracy Test" in text:
@@ -616,7 +615,6 @@ def infer_parser(filename, text):
     if "Central Frequency Test" in text:
         return parse_central_frequency(text)
 
-    # Fallback to filename-based detection
     if "slice thickness" in lower_name:
         return parse_slice_thickness(text)
     if "position" in lower_name:
@@ -1250,6 +1248,68 @@ def build_results_table(results_df, styles):
     return table
 
 
+def build_full_session_table(results_df, styles):
+    df = normalize_history_df(results_df).copy()
+    df = sort_tests_acr(df)
+
+    cell_style = styles["TableCellCustom"]
+    header_style = styles["TableHeaderCustom"]
+
+    table_data = [[
+        Paragraph("Source File", header_style),
+        Paragraph("Sequence", header_style),
+        Paragraph("Test", header_style),
+        Paragraph("Value", header_style),
+        Paragraph("Tolerance", header_style),
+        Paragraph("Status", header_style),
+    ]]
+
+    for _, row in df.iterrows():
+        source_text = str(row.get("source_file", "") or "")
+        seq_text = str(row.get("sequence_label", "") or "")
+        test_text = str(row.get("test_name", "") or "")
+        value_text = format_value_unit(row.get("value", None), row.get("unit", ""))
+        criteria_text = str(row.get("criteria", "") or "")
+
+        table_data.append([
+            Paragraph(source_text, cell_style),
+            Paragraph(seq_text, cell_style),
+            Paragraph(test_text, cell_style),
+            Paragraph(value_text, cell_style),
+            Paragraph(criteria_text, cell_style),
+            status_paragraph(row.get("status", ""), styles),
+        ])
+
+    table = Table(
+        table_data,
+        colWidths=[120, 50, 130, 65, 135, 40],
+        repeatRows=1,
+        splitByRow=1,
+    )
+
+    ts = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9CA3AF")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#EEF3F8")]),
+    ])
+
+    for idx, (_, row) in enumerate(df.iterrows(), start=1):
+        if str(row.get("status", "")).upper() == "PASS":
+            ts.add("BACKGROUND", (5, idx), (5, idx), colors.HexColor("#DCFCE7"))
+        else:
+            ts.add("BACKGROUND", (5, idx), (5, idx), colors.HexColor("#FEE2E2"))
+
+    table.setStyle(ts)
+    return table
+
+
 # =========================================================
 # CHARTS / PDF
 # =========================================================
@@ -1304,7 +1364,15 @@ def create_trend_chart(df, test_name):
     return fig, chart_path
 
 
-def build_pdf_report(results_df, history_df, site_name, scanner_name, session_label, timestamp_str):
+def build_pdf_report(
+    combined_results_df,
+    full_session_results_df,
+    history_df,
+    site_name,
+    scanner_name,
+    session_label,
+    timestamp_str,
+):
     safe_scanner = sanitize_filename(scanner_name or "scanner")
     safe_date = format_session_date(timestamp_str) or datetime.now().strftime("%Y-%m-%d")
     pdf_path = REPORTS_DIR / f"ACR_QC_Report_{safe_scanner}_{safe_date}.pdf"
@@ -1320,8 +1388,11 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
     styles = get_pdf_styles()
     elements = []
 
-    results_df = normalize_history_df(results_df).copy()
-    results_df = sort_tests_acr(results_df)
+    combined_results_df = normalize_history_df(combined_results_df).copy()
+    combined_results_df = sort_tests_acr(combined_results_df)
+
+    full_session_results_df = normalize_history_df(full_session_results_df).copy()
+    full_session_results_df = sort_tests_acr(full_session_results_df)
 
     add_pdf_header(
         elements,
@@ -1339,7 +1410,7 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
     elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(timestamp_str)}", styles["MetaCustom"]))
     elements.append(Spacer(1, 8))
 
-    overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
+    overall = "PASS" if (combined_results_df["status"] == "PASS").all() else "FAIL"
     overall_color = "#166534" if overall == "PASS" else "#991B1B"
     elements.append(
         Paragraph(
@@ -1349,20 +1420,28 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
     )
     elements.append(Spacer(1, 4))
 
-    elements.append(Paragraph("Results Summary", styles["SectionHeadingCustom"]))
-    elements.append(build_results_table(results_df, styles))
+    elements.append(Paragraph("Combined Results Summary", styles["SectionHeadingCustom"]))
+    elements.append(build_results_table(combined_results_df, styles))
     elements.append(Spacer(1, 12))
 
-    elements.append(Paragraph("Parsed Details", styles["SectionHeadingCustom"]))
-    for _, row in results_df.iterrows():
-        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"]))
+    elements.append(Paragraph("All Parsed Session Tests", styles["SectionHeadingCustom"]))
+    elements.append(build_full_session_table(full_session_results_df, styles))
+    elements.append(Spacer(1, 12))
+
+    elements.append(Paragraph("Parsed Details for All Session Entries", styles["SectionHeadingCustom"]))
+    for _, row in full_session_results_df.iterrows():
+        src = str(row.get("source_file", "") or "")
+        seq = str(row.get("sequence_label", "") or "")
+        label_bits = [x for x in [src, seq, row["test_name"]] if str(x).strip()]
+        label = " | ".join(label_bits)
+        elements.append(Paragraph(f"<b>{label}:</b> {row['details']}", styles["MetaCustom"]))
         elements.append(Spacer(1, 4))
 
     elements.append(Spacer(1, 8))
     elements.append(Paragraph("Trend Charts", styles["SectionHeadingCustom"]))
     added_any_chart = False
 
-    for test_name in results_df["test_name"].tolist():
+    for test_name in combined_results_df["test_name"].tolist():
         fig, _ = create_trend_chart(history_df, test_name)
         if fig is not None:
             added_any_chart = True
@@ -1781,13 +1860,17 @@ if uploaded_files:
                     temp_history = pd.concat([temp_history, current_rows], ignore_index=True)
                     temp_history = normalize_history_df(temp_history)
 
+                full_session_results_df = pd.DataFrame(parsed_results)
+                full_session_results_df = normalize_history_df(full_session_results_df)
+
                 pdf_path = build_pdf_report(
-                    results_df,
-                    temp_history,
-                    site_name,
-                    scanner_name,
-                    session_label,
-                    timestamp_str,
+                    combined_results_df=results_df,
+                    full_session_results_df=full_session_results_df,
+                    history_df=temp_history,
+                    site_name=site_name,
+                    scanner_name=scanner_name,
+                    session_label=session_label,
+                    timestamp_str=timestamp_str,
                 )
 
                 with open(pdf_path, "rb") as f:
