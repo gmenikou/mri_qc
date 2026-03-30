@@ -1074,26 +1074,6 @@ def get_pdf_styles():
             textColor=colors.black,
         )
     )
-    styles.add(
-        ParagraphStyle(
-            name="PassBadge",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=10,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#166534"),
-        )
-    )
-    styles.add(
-        ParagraphStyle(
-            name="FailBadge",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
-            fontSize=10,
-            alignment=TA_CENTER,
-            textColor=colors.HexColor("#991B1B"),
-        )
-    )
 
     return styles
 
@@ -1118,13 +1098,6 @@ def add_pdf_header(elements, styles, title, subtitle="", site_name="", scanner_n
     elements.append(Spacer(1, 8))
 
 
-def status_paragraph(status, styles):
-    s = str(status).upper().strip()
-    if s == "PASS":
-        return Paragraph("PASS", styles["PassBadge"])
-    return Paragraph("FAIL", styles["FailBadge"])
-
-
 def format_value_unit(value, unit):
     if pd.isna(value):
         return ""
@@ -1140,33 +1113,82 @@ def build_results_table(results_df, styles):
     df = normalize_history_df(results_df).copy()
     df = sort_tests_acr(df)
 
+    cell_style = ParagraphStyle(
+        name="TableCell",
+        parent=styles["MetaCustom"],
+        fontName="Helvetica",
+        fontSize=9,
+        leading=11,
+        wordWrap="CJK",
+        alignment=TA_LEFT,
+    )
+
+    header_style = ParagraphStyle(
+        name="TableHeader",
+        parent=styles["MetaCustom"],
+        fontName="Helvetica-Bold",
+        fontSize=9,
+        leading=11,
+        textColor=colors.white,
+        alignment=TA_LEFT,
+    )
+
+    status_style_pass = ParagraphStyle(
+        name="TableStatusPass",
+        parent=cell_style,
+        fontName="Helvetica-Bold",
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#166534"),
+    )
+
+    status_style_fail = ParagraphStyle(
+        name="TableStatusFail",
+        parent=cell_style,
+        fontName="Helvetica-Bold",
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#991B1B"),
+    )
+
     table_data = [[
-        Paragraph("<b>Test</b>", styles["MetaCustom"]),
-        Paragraph("<b>Value</b>", styles["MetaCustom"]),
-        Paragraph("<b>Tolerance</b>", styles["MetaCustom"]),
-        Paragraph("<b>Status</b>", styles["MetaCustom"]),
+        Paragraph("Test", header_style),
+        Paragraph("Value", header_style),
+        Paragraph("Tolerance", header_style),
+        Paragraph("Status", header_style),
     ]]
 
     for _, row in df.iterrows():
+        status_txt = str(row["status"]).upper().strip()
+        status_para = Paragraph(
+            status_txt,
+            status_style_pass if status_txt == "PASS" else status_style_fail,
+        )
+
         table_data.append([
-            Paragraph(str(row["test_name"]), styles["MetaCustom"]),
-            Paragraph(format_value_unit(row["value"], row["unit"]), styles["MetaCustom"]),
-            Paragraph(str(row["criteria"]), styles["MetaCustom"]),
-            status_paragraph(row["status"], styles),
+            Paragraph(str(row["test_name"]), cell_style),
+            Paragraph(format_value_unit(row["value"], row["unit"]), cell_style),
+            Paragraph(str(row["criteria"]), cell_style),
+            status_para,
         ])
 
-    table = Table(table_data, colWidths=[180, 90, 180, 60], repeatRows=1)
+    table = Table(
+        table_data,
+        colWidths=[170, 90, 210, 50],
+        repeatRows=1,
+        hAlign="LEFT",
+    )
+
     ts = TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9CA3AF")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#EEF3F8")]),
+        ("ALIGN", (3, 1), (3, -1), "CENTER"),
     ])
 
     for idx, (_, row) in enumerate(df.iterrows(), start=1):
@@ -1237,10 +1259,10 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
     doc = SimpleDocTemplate(
         str(pdf_path),
         pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=30,
-        bottomMargin=30,
+        rightMargin=30,
+        leftMargin=30,
+        topMargin=28,
+        bottomMargin=28,
     )
     styles = get_pdf_styles()
     elements = []
@@ -1310,10 +1332,10 @@ def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, sca
     doc = SimpleDocTemplate(
         str(pdf_path),
         pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=30,
-        bottomMargin=30,
+        rightMargin=30,
+        leftMargin=30,
+        topMargin=28,
+        bottomMargin=28,
     )
 
     styles = get_pdf_styles()
@@ -1406,10 +1428,10 @@ def build_single_session_pdf(session_df):
     doc = SimpleDocTemplate(
         str(pdf_path),
         pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=30,
-        bottomMargin=30,
+        rightMargin=30,
+        leftMargin=30,
+        topMargin=28,
+        bottomMargin=28,
     )
 
     styles = get_pdf_styles()
@@ -1448,6 +1470,8 @@ def build_single_session_pdf(session_df):
     elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(first['timestamp'])}", styles["MetaCustom"]))
     elements.append(Paragraph(f"<b>Timestamp:</b> {first['timestamp']}", styles["MetaCustom"]))
     elements.append(Paragraph(f"<b>Session label:</b> {first['session_label']}", styles["MetaCustom"]))
+    elements.append(Paragraph(f"<b>Site:</b> {first['site_name']}", styles["MetaCustom"]))
+    elements.append(Paragraph(f"<b>Scanner:</b> {first['scanner_name']}", styles["MetaCustom"]))
     elements.append(Paragraph(f"<b>System ID:</b> {first['scanner_id']}", styles["MetaCustom"]))
     elements.append(Spacer(1, 8))
 
@@ -1457,15 +1481,17 @@ def build_single_session_pdf(session_df):
             styles["SectionHeadingCustom"],
         )
     )
-    elements.append(Spacer(1, 6))
+    elements.append(Spacer(1, 8))
 
     elements.append(Paragraph("Results Summary", styles["SectionHeadingCustom"]))
     elements.append(build_results_table(df, styles))
-    elements.append(Spacer(1, 12))
+    elements.append(Spacer(1, 14))
 
-    elements.append(Paragraph("Details", styles["SectionHeadingCustom"]))
+    elements.append(Paragraph("Parsed Details", styles["SectionHeadingCustom"]))
     for _, row in df.iterrows():
-        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"]))
+        elements.append(
+            Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"])
+        )
         elements.append(Spacer(1, 4))
 
     doc.build(elements)
