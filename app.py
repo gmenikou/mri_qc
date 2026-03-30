@@ -59,10 +59,22 @@ def safe_float(text):
         return None
 
 
+def validate_iso_timestamp(ts: str) -> bool:
+    try:
+        datetime.fromisoformat(ts)
+        return True
+    except Exception:
+        return False
+
+
 def build_scanner_id(site_name: str, scanner_name: str) -> str:
     raw = f"{str(site_name).strip()}__{str(scanner_name).strip()}".lower()
     raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
     return raw or "unknown_scanner"
+
+
+def sanitize_filename(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(text or "").strip()) or "file"
 
 
 def get_history_columns():
@@ -484,16 +496,22 @@ def parse_ghosting(text):
 def parse_lcd(text):
     t1 = re.search(r"Number of complete spokes in T1:\s*([0-9.\-]+)", text, re.I)
     t2 = re.search(r"Number of complete spokes in T2:\s*([0-9.\-]+)", text, re.I)
+
     v1 = safe_float(t1.group(1)) if t1 else None
     v2 = safe_float(t2.group(1)) if t2 else None
+
+    vals = [v for v in [v1, v2] if v is not None]
+    worst_value = min(vals) if vals else None
+
     passed = (v1 is not None and v1 >= 37) and (v2 is not None and v2 >= 37)
+
     return {
         "test_name": "Low Contrast Detectability",
-        "value": None,
+        "value": worst_value,
         "unit": "spokes",
         "criteria": "Site/ACR target threshold, commonly >= 37 for strong performance",
         "status": "PASS" if passed else "FAIL",
-        "details": f"T1 spokes: {v1}, T2 spokes: {v2}",
+        "details": f"T1 spokes: {v1}, T2 spokes: {v2}, worst: {worst_value}",
     }
 
 
@@ -514,13 +532,16 @@ def parse_uniformity(text, modality_name):
 def parse_hcr(text, modality_name):
     upper = re.search(r"Upper hole size \[mm\]:\s*([0-9.\-]+)", text, re.I)
     lower = re.search(r"Lower hole size \[mm\]:\s*([0-9.\-]+)", text, re.I)
+
     up = safe_float(upper.group(1)) if upper else None
     lo = safe_float(lower.group(1)) if lower else None
+
     passed = (up is not None and up <= 1.0) and (lo is not None and lo <= 1.0)
-    best_value = max([v for v in [up, lo] if v is not None], default=None)
+    worst_value = max([v for v in [up, lo] if v is not None], default=None)
+
     return {
         "test_name": modality_name,
-        "value": best_value,
+        "value": worst_value,
         "unit": "mm",
         "criteria": "Must resolve 1.0 mm holes",
         "status": "PASS" if passed else "FAIL",
@@ -1048,6 +1069,8 @@ def get_pdf_styles():
             alignment=TA_CENTER,
             textColor=colors.HexColor("#4B5563"),
             spaceAfter=8,
+            wordWrap="LTR",
+            splitLongWords=1,
         )
     )
     styles.add(
@@ -1061,6 +1084,8 @@ def get_pdf_styles():
             textColor=colors.HexColor("#183A63"),
             spaceBefore=6,
             spaceAfter=6,
+            wordWrap="LTR",
+            splitLongWords=1,
         )
     )
     styles.add(
@@ -1068,10 +1093,58 @@ def get_pdf_styles():
             name="MetaCustom",
             parent=styles["Normal"],
             fontName="Helvetica",
-            fontSize=9,
-            leading=12,
+            fontSize=8.5,
+            leading=11,
             alignment=TA_LEFT,
             textColor=colors.black,
+            wordWrap="LTR",
+            splitLongWords=1,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="TableCellCustom",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8,
+            leading=10,
+            alignment=TA_LEFT,
+            textColor=colors.black,
+            wordWrap="LTR",
+            splitLongWords=1,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="TableHeaderCustom",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            alignment=TA_LEFT,
+            textColor=colors.white,
+            wordWrap="LTR",
+            splitLongWords=1,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="PassBadge",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor("#166534"),
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="FailBadge",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor("#991B1B"),
         )
     )
 
@@ -1098,9 +1171,21 @@ def add_pdf_header(elements, styles, title, subtitle="", site_name="", scanner_n
     elements.append(Spacer(1, 8))
 
 
+def status_paragraph(status, styles):
+    s = str(status).upper().strip()
+    if s == "PASS":
+        return Paragraph("PASS", styles["PassBadge"])
+    return Paragraph("FAIL", styles["FailBadge"])
+
+
 def format_value_unit(value, unit):
     if pd.isna(value):
         return ""
+    try:
+        if float(value).is_integer():
+            value = int(value)
+    except Exception:
+        pass
     return f"{value} {unit}".strip()
 
 
@@ -1113,41 +1198,8 @@ def build_results_table(results_df, styles):
     df = normalize_history_df(results_df).copy()
     df = sort_tests_acr(df)
 
-    cell_style = ParagraphStyle(
-        name="TableCell",
-        parent=styles["MetaCustom"],
-        fontName="Helvetica",
-        fontSize=9,
-        leading=11,
-        wordWrap="CJK",
-        alignment=TA_LEFT,
-    )
-
-    header_style = ParagraphStyle(
-        name="TableHeader",
-        parent=styles["MetaCustom"],
-        fontName="Helvetica-Bold",
-        fontSize=9,
-        leading=11,
-        textColor=colors.white,
-        alignment=TA_LEFT,
-    )
-
-    status_style_pass = ParagraphStyle(
-        name="TableStatusPass",
-        parent=cell_style,
-        fontName="Helvetica-Bold",
-        alignment=TA_CENTER,
-        textColor=colors.HexColor("#166534"),
-    )
-
-    status_style_fail = ParagraphStyle(
-        name="TableStatusFail",
-        parent=cell_style,
-        fontName="Helvetica-Bold",
-        alignment=TA_CENTER,
-        textColor=colors.HexColor("#991B1B"),
-    )
+    cell_style = styles["TableCellCustom"]
+    header_style = styles["TableHeaderCustom"]
 
     table_data = [[
         Paragraph("Test", header_style),
@@ -1157,24 +1209,22 @@ def build_results_table(results_df, styles):
     ]]
 
     for _, row in df.iterrows():
-        status_txt = str(row["status"]).upper().strip()
-        status_para = Paragraph(
-            status_txt,
-            status_style_pass if status_txt == "PASS" else status_style_fail,
-        )
+        value_text = format_value_unit(row["value"], row["unit"])
+        criteria_text = str(row["criteria"]) if pd.notna(row["criteria"]) else ""
+        test_text = str(row["test_name"]) if pd.notna(row["test_name"]) else ""
 
         table_data.append([
-            Paragraph(str(row["test_name"]), cell_style),
-            Paragraph(format_value_unit(row["value"], row["unit"]), cell_style),
-            Paragraph(str(row["criteria"]), cell_style),
-            status_para,
+            Paragraph(test_text, cell_style),
+            Paragraph(value_text, cell_style),
+            Paragraph(criteria_text, cell_style),
+            status_paragraph(row["status"], styles),
         ])
 
     table = Table(
         table_data,
-        colWidths=[170, 90, 210, 50],
+        colWidths=[170, 80, 210, 50],
         repeatRows=1,
-        hAlign="LEFT",
+        splitByRow=1,
     )
 
     ts = TableStyle([
@@ -1185,10 +1235,9 @@ def build_results_table(results_df, styles):
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
         ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#EEF3F8")]),
-        ("ALIGN", (3, 1), (3, -1), "CENTER"),
     ])
 
     for idx, (_, row) in enumerate(df.iterrows(), start=1):
@@ -1220,6 +1269,7 @@ def add_reference_lines(ax, selected_test):
         ax.axhline(5.7, linestyle="--", alpha=0.7)
     elif selected_test == "Slice Position Accuracy":
         ax.axhline(5.0, linestyle="--", alpha=0.7)
+        ax.axhline(-5.0, linestyle="--", alpha=0.7)
     elif selected_test == "Percentage Signal Ghosting":
         ax.axhline(2.5, linestyle="--", alpha=0.7)
     elif selected_test in ["Image Uniformity T1", "Image Uniformity T2"]:
@@ -1255,14 +1305,17 @@ def create_trend_chart(df, test_name):
 
 
 def build_pdf_report(results_df, history_df, site_name, scanner_name, session_label, timestamp_str):
-    pdf_path = REPORTS_DIR / f"ACR_QC_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    safe_scanner = sanitize_filename(scanner_name or "scanner")
+    safe_date = format_session_date(timestamp_str) or datetime.now().strftime("%Y-%m-%d")
+    pdf_path = REPORTS_DIR / f"ACR_QC_Report_{safe_scanner}_{safe_date}.pdf"
+
     doc = SimpleDocTemplate(
         str(pdf_path),
         pagesize=A4,
-        rightMargin=30,
-        leftMargin=30,
-        topMargin=28,
-        bottomMargin=28,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=30,
+        bottomMargin=30,
     )
     styles = get_pdf_styles()
     elements = []
@@ -1327,15 +1380,16 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
 
 
 def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, scanner_id=None):
-    pdf_path = REPORTS_DIR / f"ACR_QC_Session_Summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    scanner_fragment = sanitize_filename(scanner_name or scanner_id or "scanner")
+    pdf_path = REPORTS_DIR / f"ACR_QC_Session_Summary_{scanner_fragment}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
 
     doc = SimpleDocTemplate(
         str(pdf_path),
         pagesize=A4,
-        rightMargin=30,
-        leftMargin=30,
-        topMargin=28,
-        bottomMargin=28,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=30,
+        bottomMargin=30,
     )
 
     styles = get_pdf_styles()
@@ -1428,10 +1482,10 @@ def build_single_session_pdf(session_df):
     doc = SimpleDocTemplate(
         str(pdf_path),
         pagesize=A4,
-        rightMargin=30,
-        leftMargin=30,
-        topMargin=28,
-        bottomMargin=28,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=30,
+        bottomMargin=30,
     )
 
     styles = get_pdf_styles()
@@ -1470,8 +1524,6 @@ def build_single_session_pdf(session_df):
     elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(first['timestamp'])}", styles["MetaCustom"]))
     elements.append(Paragraph(f"<b>Timestamp:</b> {first['timestamp']}", styles["MetaCustom"]))
     elements.append(Paragraph(f"<b>Session label:</b> {first['session_label']}", styles["MetaCustom"]))
-    elements.append(Paragraph(f"<b>Site:</b> {first['site_name']}", styles["MetaCustom"]))
-    elements.append(Paragraph(f"<b>Scanner:</b> {first['scanner_name']}", styles["MetaCustom"]))
     elements.append(Paragraph(f"<b>System ID:</b> {first['scanner_id']}", styles["MetaCustom"]))
     elements.append(Spacer(1, 8))
 
@@ -1481,17 +1533,15 @@ def build_single_session_pdf(session_df):
             styles["SectionHeadingCustom"],
         )
     )
-    elements.append(Spacer(1, 8))
+    elements.append(Spacer(1, 6))
 
     elements.append(Paragraph("Results Summary", styles["SectionHeadingCustom"]))
     elements.append(build_results_table(df, styles))
-    elements.append(Spacer(1, 14))
+    elements.append(Spacer(1, 12))
 
-    elements.append(Paragraph("Parsed Details", styles["SectionHeadingCustom"]))
+    elements.append(Paragraph("Details", styles["SectionHeadingCustom"]))
     for _, row in df.iterrows():
-        elements.append(
-            Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"])
-        )
+        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"]))
         elements.append(Spacer(1, 4))
 
     doc.build(elements)
@@ -1516,6 +1566,21 @@ if "parsed_results" not in st.session_state:
 
 if "combined_results" not in st.session_state:
     st.session_state.combined_results = []
+
+if "last_upload_signature" not in st.session_state:
+    st.session_state.last_upload_signature = None
+
+if "pdf_report_bytes" not in st.session_state:
+    st.session_state.pdf_report_bytes = None
+    st.session_state.pdf_report_name = None
+
+if "summary_pdf_bytes" not in st.session_state:
+    st.session_state.summary_pdf_bytes = None
+    st.session_state.summary_pdf_name = None
+
+if "selected_session_pdf_bytes" not in st.session_state:
+    st.session_state.selected_session_pdf_bytes = None
+    st.session_state.selected_session_pdf_name = None
 
 try:
     SECRET_GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
@@ -1594,7 +1659,14 @@ with st.sidebar:
 
     session_label = st.text_input("Session label", value="Monthly QC")
     custom_timestamp = st.text_input("Timestamp (optional, ISO format)", value="")
-    timestamp_str = custom_timestamp.strip() or datetime.now().isoformat(timespec="seconds")
+
+    if custom_timestamp.strip():
+        if not validate_iso_timestamp(custom_timestamp.strip()):
+            st.error("Timestamp must be valid ISO format, e.g. 2026-03-30T14:20:00")
+            st.stop()
+        timestamp_str = custom_timestamp.strip()
+    else:
+        timestamp_str = datetime.now().isoformat(timespec="seconds")
 
     if USE_GITHUB:
         st.success("GitHub history storage is active.")
@@ -1606,6 +1678,18 @@ uploaded_files = st.file_uploader(
     type=["txt"],
     accept_multiple_files=True,
 )
+
+current_upload_signature = (
+    tuple(sorted([f.name for f in uploaded_files])) if uploaded_files else (),
+    site_name.strip(),
+    scanner_name.strip(),
+    session_label.strip(),
+    timestamp_str.strip(),
+)
+
+if st.session_state.last_upload_signature != current_upload_signature:
+    st.session_state.session_saved = False
+    st.session_state.last_upload_signature = current_upload_signature
 
 parsed_results = []
 combined_results = []
@@ -1629,8 +1713,13 @@ if uploaded_files:
     results_df = sort_tests_acr(results_df)
 
     st.subheader("Current session results")
+    display_cols = [
+        c for c in
+        ["source_file", "sequence_label", "test_name", "value", "unit", "criteria", "status", "details"]
+        if c in results_df.columns
+    ]
     st.dataframe(
-        results_df[["source_file", "sequence_label", "test_name", "value", "unit", "criteria", "status", "details"]],
+        results_df[display_cols],
         use_container_width=True,
     )
 
@@ -1640,7 +1729,7 @@ if uploaded_files:
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        if st.button("Save session to history", type="primary"):
+        if st.button("Save session to history", type="primary", key="save_session_to_history"):
             if not site_name.strip() or not scanner_name.strip():
                 st.error("Please enter both Site / Hospital and Scanner / System.")
             else:
@@ -1663,7 +1752,7 @@ if uploaded_files:
                     st.success(f"Saved {len(combined_results)} results to history for system: {scanner_id}")
 
     with col2:
-        if st.button("Generate PDF report"):
+        if st.button("Generate PDF report", key="generate_pdf_report"):
             if not site_name.strip() or not scanner_name.strip():
                 st.error("Please enter both Site / Hospital and Scanner / System.")
             else:
@@ -1702,16 +1791,13 @@ if uploaded_files:
                 )
 
                 with open(pdf_path, "rb") as f:
-                    st.download_button(
-                        "Download PDF report",
-                        data=f.read(),
-                        file_name=pdf_path.name,
-                        mime="application/pdf",
-                    )
-                st.success(f"PDF report created: {pdf_path}")
+                    st.session_state.pdf_report_bytes = f.read()
+                    st.session_state.pdf_report_name = pdf_path.name
+
+                st.success(f"PDF report created: {pdf_path.name}")
 
     with col3:
-        if st.button("Generate session summary PDF"):
+        if st.button("Generate session summary PDF", key="generate_session_summary_pdf"):
             if not site_name.strip() or not scanner_name.strip():
                 st.error("Please enter both Site / Hospital and Scanner / System.")
             else:
@@ -1749,13 +1835,28 @@ if uploaded_files:
                 )
 
                 with open(pdf_path, "rb") as f:
-                    st.download_button(
-                        "Download session summary PDF",
-                        data=f.read(),
-                        file_name=pdf_path.name,
-                        mime="application/pdf",
-                    )
-                st.success(f"Session summary PDF created: {pdf_path}")
+                    st.session_state.summary_pdf_bytes = f.read()
+                    st.session_state.summary_pdf_name = pdf_path.name
+
+                st.success(f"Session summary PDF created: {pdf_path.name}")
+
+    if st.session_state.pdf_report_bytes:
+        st.download_button(
+            "Download PDF report",
+            data=st.session_state.pdf_report_bytes,
+            file_name=st.session_state.pdf_report_name,
+            mime="application/pdf",
+            key="download_pdf_report",
+        )
+
+    if st.session_state.summary_pdf_bytes:
+        st.download_button(
+            "Download session summary PDF",
+            data=st.session_state.summary_pdf_bytes,
+            file_name=st.session_state.summary_pdf_name,
+            mime="application/pdf",
+            key="download_summary_pdf",
+        )
 
 else:
     parsed_results = st.session_state.get("parsed_results", [])
@@ -1839,24 +1940,24 @@ else:
             key="front_test_select",
         )
 
-    date_options = (
+    timestamp_options = (
         history_df.loc[history_df["scanner_id"] == selected_system, "timestamp"]
         .dropna()
         .astype(str)
         .unique()
         .tolist()
     )
-    date_options = sorted(date_options, reverse=True)
+    timestamp_options = sorted(timestamp_options, reverse=True)
 
-    if date_options:
-        selected_date = st.selectbox(
-            "Select session date",
-            date_options,
-            key="front_date_select",
+    if timestamp_options:
+        selected_timestamp = st.selectbox(
+            "Select session timestamp",
+            timestamp_options,
+            key="front_timestamp_select",
         )
     else:
-        selected_date = None
-        st.info("No saved session dates available for the selected system.")
+        selected_timestamp = None
+        st.info("No saved session timestamps available for the selected system.")
 
     plot_df = system_df[system_df["test_name"] == selected_test].copy().sort_values("timestamp_dt")
     plot_df = plot_df.dropna(subset=["timestamp_dt", "value"])
@@ -1912,15 +2013,16 @@ else:
             data=csv_bytes,
             file_name=f"{selected_test}_{selected_system}_trend.csv".replace(" ", "_").replace("/", "_"),
             mime="text/csv",
+            key="download_trend_csv",
         )
 
     st.subheader("Print selected session")
 
     if st.button("Generate PDF for selected session", key="front_selected_session_pdf"):
-        if not selected_system or not selected_date:
-            st.error("Please select system and session date.")
+        if not selected_system or not selected_timestamp:
+            st.error("Please select system and session timestamp.")
         else:
-            session_df = build_single_session_df(history_df, selected_system, selected_date)
+            session_df = build_single_session_df(history_df, selected_system, selected_timestamp)
 
             if session_df.empty:
                 st.warning("No data found for selected session.")
@@ -1928,12 +2030,16 @@ else:
                 pdf_path = build_single_session_pdf(session_df)
 
                 with open(pdf_path, "rb") as f:
-                    st.download_button(
-                        "Download selected session PDF",
-                        data=f.read(),
-                        file_name=pdf_path.name,
-                        mime="application/pdf",
-                        key="front_selected_session_pdf_download",
-                    )
+                    st.session_state.selected_session_pdf_bytes = f.read()
+                    st.session_state.selected_session_pdf_name = pdf_path.name
 
-                st.success(f"Selected session PDF created: {pdf_path}")
+                st.success(f"Selected session PDF created: {pdf_path.name}")
+
+    if st.session_state.selected_session_pdf_bytes:
+        st.download_button(
+            "Download selected session PDF",
+            data=st.session_state.selected_session_pdf_bytes,
+            file_name=st.session_state.selected_session_pdf_name,
+            mime="application/pdf",
+            key="front_selected_session_pdf_download",
+        )
