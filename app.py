@@ -21,6 +21,7 @@ from reportlab.platypus import (
     Spacer,
     Table,
     TableStyle,
+    PageBreak,
 )
 
 APP_TITLE = "ACR MRI Large Phantom QC Reporter"
@@ -1088,6 +1089,109 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
     return pdf_path
 
 
+def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, scanner_id=None):
+    pdf_path = REPORTS_DIR / f"ACR_QC_Session_Summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
+
+    styles = getSampleStyleSheet()
+    elements = []
+
+    df = normalize_history_df(history_df).copy()
+    if df.empty:
+        elements.append(Paragraph("ACR MRI Large Phantom QC Session Summary", styles["Title"]))
+        elements.append(Spacer(1, 12))
+        elements.append(Paragraph("No history data available.", styles["Normal"]))
+        doc.build(elements)
+        return pdf_path
+
+    if scanner_id:
+        df = df[df["scanner_id"] == scanner_id].copy()
+    else:
+        if site_name:
+            df = df[df["site_name"] == site_name].copy()
+        if scanner_name:
+            df = df[df["scanner_name"] == scanner_name].copy()
+
+    if df.empty:
+        elements.append(Paragraph("ACR MRI Large Phantom QC Session Summary", styles["Title"]))
+        elements.append(Spacer(1, 12))
+        elements.append(Paragraph("No matching session history found for the selected scanner.", styles["Normal"]))
+        doc.build(elements)
+        return pdf_path
+
+    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.sort_values("timestamp_dt", ascending=False)
+
+    elements.append(Paragraph("ACR MRI Large Phantom QC Session Summary", styles["Title"]))
+    elements.append(Spacer(1, 8))
+
+    if site_name:
+        elements.append(Paragraph(f"<b>Site:</b> {site_name}", styles["Normal"]))
+    if scanner_name:
+        elements.append(Paragraph(f"<b>Scanner:</b> {scanner_name}", styles["Normal"]))
+    if scanner_id:
+        elements.append(Paragraph(f"<b>System ID:</b> {scanner_id}", styles["Normal"]))
+
+    elements.append(Spacer(1, 14))
+
+    group_cols = ["timestamp", "session_label", "site_name", "scanner_name", "scanner_id"]
+    grouped_items = list(df.groupby(group_cols, sort=False))
+
+    for idx, ((timestamp, session_label, g_site, g_scanner, g_scanner_id), g) in enumerate(grouped_items):
+        g = g.copy().sort_values("test_name")
+        overall = "PASS" if (g["status"] == "PASS").all() else "FAIL"
+        display_date = str(timestamp).split("T")[0] if str(timestamp) else ""
+
+        elements.append(Paragraph(f"<b>Session date:</b> {display_date}", styles["Heading2"]))
+        elements.append(Paragraph(f"<b>Timestamp:</b> {timestamp}", styles["Normal"]))
+        elements.append(Paragraph(f"<b>Session label:</b> {session_label}", styles["Normal"]))
+        elements.append(Paragraph(f"<b>Site:</b> {g_site}", styles["Normal"]))
+        elements.append(Paragraph(f"<b>Scanner:</b> {g_scanner}", styles["Normal"]))
+        elements.append(Paragraph(f"<b>Overall result:</b> {overall}", styles["Normal"]))
+        elements.append(Spacer(1, 8))
+
+        table_data = [["Test", "Value", "Tolerance", "Status"]]
+
+        for _, row in g.iterrows():
+            value_txt = "" if pd.isna(row["value"]) else f"{row['value']} {row['unit']}".strip()
+            table_data.append([
+                str(row["test_name"]),
+                value_txt,
+                str(row["criteria"]),
+                str(row["status"]),
+            ])
+
+        table = Table(table_data, colWidths=[180, 90, 170, 70])
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+                ]
+            )
+        )
+
+        elements.append(table)
+
+        if idx < len(grouped_items) - 1:
+            elements.append(PageBreak())
+
+    doc.build(elements)
+    return pdf_path
+
+
 # =========================================================
 # APP
 # =========================================================
@@ -1226,7 +1330,7 @@ if uploaded_files:
     overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
     st.metric("Overall session result", overall)
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         if st.button("Save session to history", type="primary"):
@@ -1298,6 +1402,53 @@ if uploaded_files:
                         mime="application/pdf",
                     )
                 st.success(f"PDF report created: {pdf_path}")
+
+    with col3:
+        if st.button("Generate session summary PDF"):
+            if not site_name.strip() or not scanner_name.strip():
+                st.error("Please enter both Site / Hospital and Scanner / System.")
+            else:
+                summary_history = history_df.copy()
+
+                if uploaded_files and combined_results and not st.session_state.session_saved:
+                    current_rows = pd.DataFrame(
+                        [
+                            {
+                                "timestamp": timestamp_str,
+                                "session_label": session_label,
+                                "site_name": site_name,
+                                "scanner_name": scanner_name,
+                                "scanner_id": scanner_id,
+                                "test_name": r["test_name"],
+                                "value": r["value"],
+                                "unit": r["unit"],
+                                "criteria": r["criteria"],
+                                "status": r["status"],
+                                "details": r["details"],
+                                "source_file": r.get("source_file", ""),
+                                "sequence_label": r.get("sequence_label", ""),
+                            }
+                            for r in combined_results
+                        ]
+                    )
+                    summary_history = pd.concat([summary_history, current_rows], ignore_index=True)
+                    summary_history = normalize_history_df(summary_history)
+
+                pdf_path = build_session_summary_pdf(
+                    summary_history,
+                    site_name=site_name,
+                    scanner_name=scanner_name,
+                    scanner_id=scanner_id,
+                )
+
+                with open(pdf_path, "rb") as f:
+                    st.download_button(
+                        "Download session summary PDF",
+                        data=f.read(),
+                        file_name=pdf_path.name,
+                        mime="application/pdf",
+                    )
+                st.success(f"Session summary PDF created: {pdf_path}")
 
 else:
     parsed_results = st.session_state.get("parsed_results", [])
