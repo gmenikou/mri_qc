@@ -357,6 +357,17 @@ def build_frontpage_trend_df(history_df, include_current_df=None):
     return out
 
 
+def build_single_session_df(history_df, scanner_id, timestamp):
+    df = normalize_history_df(history_df).copy()
+    if df.empty:
+        return empty_history_df()
+
+    return df[
+        (df["scanner_id"].astype(str) == str(scanner_id))
+        & (df["timestamp"].astype(str) == str(timestamp))
+    ].copy()
+
+
 # =========================================================
 # PARSERS
 # =========================================================
@@ -1192,6 +1203,83 @@ def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, sca
     return pdf_path
 
 
+def build_single_session_pdf(session_df):
+    pdf_path = REPORTS_DIR / f"ACR_QC_Selected_Session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+
+    doc = SimpleDocTemplate(
+        str(pdf_path),
+        pagesize=A4,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
+
+    styles = getSampleStyleSheet()
+    elements = []
+
+    df = normalize_history_df(session_df).copy()
+    if df.empty:
+        elements.append(Paragraph("ACR MRI Large Phantom QC Session Report", styles["Title"]))
+        elements.append(Spacer(1, 12))
+        elements.append(Paragraph("No data found for the selected session.", styles["Normal"]))
+        doc.build(elements)
+        return pdf_path
+
+    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.sort_values("test_name")
+
+    first = df.iloc[0]
+    overall = "PASS" if (df["status"] == "PASS").all() else "FAIL"
+    display_date = str(first["timestamp"]).split("T")[0] if str(first["timestamp"]) else ""
+
+    elements.append(Paragraph("ACR MRI Large Phantom QC Session Report", styles["Title"]))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(f"<b>Session date:</b> {display_date}", styles["Normal"]))
+    elements.append(Paragraph(f"<b>Timestamp:</b> {first['timestamp']}", styles["Normal"]))
+    elements.append(Paragraph(f"<b>Session label:</b> {first['session_label']}", styles["Normal"]))
+    elements.append(Paragraph(f"<b>Site:</b> {first['site_name']}", styles["Normal"]))
+    elements.append(Paragraph(f"<b>Scanner:</b> {first['scanner_name']}", styles["Normal"]))
+    elements.append(Paragraph(f"<b>System ID:</b> {first['scanner_id']}", styles["Normal"]))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(f"<b>Overall result:</b> {overall}", styles["Heading2"]))
+    elements.append(Spacer(1, 10))
+
+    table_data = [["Test", "Value", "Tolerance", "Status"]]
+    for _, row in df.iterrows():
+        value_txt = "" if pd.isna(row["value"]) else f"{row['value']} {row['unit']}".strip()
+        table_data.append([
+            str(row["test_name"]),
+            value_txt,
+            str(row["criteria"]),
+            str(row["status"]),
+        ])
+
+    table = Table(table_data, colWidths=[180, 90, 170, 70])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+            ]
+        )
+    )
+    elements.append(table)
+    elements.append(Spacer(1, 12))
+
+    elements.append(Paragraph("Parsed details", styles["Heading2"]))
+    for _, row in df.iterrows():
+        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["Normal"]))
+        elements.append(Spacer(1, 4))
+
+    doc.build(elements)
+    return pdf_path
+
+
 # =========================================================
 # APP
 # =========================================================
@@ -1528,6 +1616,25 @@ else:
             key="front_test_select",
         )
 
+    date_options = (
+        history_df.loc[history_df["scanner_id"] == selected_system, "timestamp"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    date_options = sorted(date_options, reverse=True)
+
+    if date_options:
+        selected_date = st.selectbox(
+            "Select session date",
+            date_options,
+            key="front_date_select",
+        )
+    else:
+        selected_date = None
+        st.info("No saved session dates available for the selected system.")
+
     plot_df = system_df[system_df["test_name"] == selected_test].copy().sort_values("timestamp_dt")
     plot_df = plot_df.dropna(subset=["timestamp_dt", "value"])
 
@@ -1583,3 +1690,27 @@ else:
             file_name=f"{selected_test}_{selected_system}_trend.csv".replace(" ", "_").replace("/", "_"),
             mime="text/csv",
         )
+
+    st.subheader("Print selected session")
+
+    if st.button("Generate PDF for selected session", key="front_selected_session_pdf"):
+        if not selected_system or not selected_date:
+            st.error("Please select system and session date.")
+        else:
+            session_df = build_single_session_df(history_df, selected_system, selected_date)
+
+            if session_df.empty:
+                st.warning("No data found for selected session.")
+            else:
+                pdf_path = build_single_session_pdf(session_df)
+
+                with open(pdf_path, "rb") as f:
+                    st.download_button(
+                        "Download selected session PDF",
+                        data=f.read(),
+                        file_name=pdf_path.name,
+                        mime="application/pdf",
+                        key="front_selected_session_pdf_download",
+                    )
+
+                st.success(f"Selected session PDF created: {pdf_path}")
