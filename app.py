@@ -12,16 +12,19 @@ import pandas as pd
 import requests
 import streamlit as st
 from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.utils import ImageReader
 from reportlab.platypus import (
+    HRFlowable,
     Image as RLImage,
+    PageBreak,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
-    PageBreak,
 )
 
 APP_TITLE = "ACR MRI Large Phantom QC Reporter"
@@ -39,6 +42,7 @@ LOCAL_HISTORY_CSV = DATA_DIR / "acr_qc_history.csv"
 LOCAL_LOCK_FILE = DATA_DIR / "acr_qc_history.lock"
 REPORTS_DIR = DATA_DIR / "reports"
 CHARTS_DIR = DATA_DIR / "charts"
+LOGO_PATH = DATA_DIR / "logo.png"  # optional
 
 DATA_DIR.mkdir(exist_ok=True)
 REPORTS_DIR.mkdir(exist_ok=True)
@@ -153,6 +157,38 @@ def github_is_ready(cfg):
     )
 
 
+def get_acr_test_order():
+    return [
+        "Geometric Accuracy",
+        "Slice Thickness Accuracy",
+        "Slice Position Accuracy",
+        "Image Uniformity T1",
+        "Image Uniformity T2",
+        "Percentage Signal Ghosting",
+        "Low Contrast Detectability",
+        "High Contrast Spatial Resolution T1",
+        "High Contrast Spatial Resolution T2",
+        "Signal to Noise Ratio",
+        "Central Frequency",
+    ]
+
+
+def acr_sort_key(test_name):
+    order = get_acr_test_order()
+    if test_name in order:
+        return (order.index(test_name), str(test_name))
+    return (999, str(test_name))
+
+
+def sort_tests_acr(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "test_name" not in df.columns:
+        return df
+    out = df.copy()
+    out["_acr_order"] = out["test_name"].apply(acr_sort_key)
+    out = out.sort_values("_acr_order").drop(columns=["_acr_order"])
+    return out
+
+
 def combine_session_results(results):
     """
     Combine parsed results so that:
@@ -240,7 +276,11 @@ def combine_session_results(results):
         else:
             combined.append(g.iloc[0].to_dict())
 
-    return combined
+    combined_df = pd.DataFrame(combined)
+    if combined_df.empty:
+        return combined
+    combined_df = sort_tests_acr(combined_df)
+    return combined_df.to_dict(orient="records")
 
 
 def build_frontpage_trend_df(history_df, include_current_df=None):
@@ -362,10 +402,11 @@ def build_single_session_df(history_df, scanner_id, timestamp):
     if df.empty:
         return empty_history_df()
 
-    return df[
+    out = df[
         (df["scanner_id"].astype(str) == str(scanner_id))
         & (df["timestamp"].astype(str) == str(timestamp))
     ].copy()
+    return sort_tests_acr(out)
 
 
 # =========================================================
@@ -980,13 +1021,175 @@ def save_results_with_lock(
 
 
 # =========================================================
+# PDF STYLES / HELPERS
+# =========================================================
+def get_pdf_styles():
+    styles = getSampleStyleSheet()
+
+    styles.add(
+        ParagraphStyle(
+            name="ReportTitleCustom",
+            parent=styles["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=18,
+            leading=22,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor("#183A63"),
+            spaceAfter=6,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="ReportSubTitleCustom",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=10,
+            leading=13,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor("#4B5563"),
+            spaceAfter=8,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="SectionHeadingCustom",
+            parent=styles["Heading2"],
+            fontName="Helvetica-Bold",
+            fontSize=12,
+            leading=14,
+            alignment=TA_LEFT,
+            textColor=colors.HexColor("#183A63"),
+            spaceBefore=6,
+            spaceAfter=6,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="MetaCustom",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=12,
+            alignment=TA_LEFT,
+            textColor=colors.black,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="PassBadge",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor("#166534"),
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            name="FailBadge",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=10,
+            alignment=TA_CENTER,
+            textColor=colors.HexColor("#991B1B"),
+        )
+    )
+
+    return styles
+
+
+def add_pdf_header(elements, styles, title, subtitle="", site_name="", scanner_name="", include_logo=True):
+    if include_logo and LOGO_PATH.exists():
+        try:
+            logo = RLImage(str(LOGO_PATH), width=110, height=40)
+            elements.append(logo)
+            elements.append(Spacer(1, 6))
+        except Exception:
+            pass
+
+    elements.append(Paragraph(title, styles["ReportTitleCustom"]))
+    if subtitle:
+        elements.append(Paragraph(subtitle, styles["ReportSubTitleCustom"]))
+    if site_name or scanner_name:
+        meta_line = " | ".join([x for x in [site_name, scanner_name] if x])
+        if meta_line:
+            elements.append(Paragraph(meta_line, styles["ReportSubTitleCustom"]))
+    elements.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#CBD5E1")))
+    elements.append(Spacer(1, 8))
+
+
+def status_paragraph(status, styles):
+    s = str(status).upper().strip()
+    if s == "PASS":
+        return Paragraph("PASS", styles["PassBadge"])
+    return Paragraph("FAIL", styles["FailBadge"])
+
+
+def format_value_unit(value, unit):
+    if pd.isna(value):
+        return ""
+    return f"{value} {unit}".strip()
+
+
+def format_session_date(ts):
+    ts = str(ts)
+    return ts.split("T")[0] if ts else ""
+
+
+def build_results_table(results_df, styles):
+    df = normalize_history_df(results_df).copy()
+    df = sort_tests_acr(df)
+
+    table_data = [[
+        Paragraph("<b>Test</b>", styles["MetaCustom"]),
+        Paragraph("<b>Value</b>", styles["MetaCustom"]),
+        Paragraph("<b>Tolerance</b>", styles["MetaCustom"]),
+        Paragraph("<b>Status</b>", styles["MetaCustom"]),
+    ]]
+
+    for _, row in df.iterrows():
+        table_data.append([
+            Paragraph(str(row["test_name"]), styles["MetaCustom"]),
+            Paragraph(format_value_unit(row["value"], row["unit"]), styles["MetaCustom"]),
+            Paragraph(str(row["criteria"]), styles["MetaCustom"]),
+            status_paragraph(row["status"], styles),
+        ])
+
+    table = Table(table_data, colWidths=[180, 90, 180, 60], repeatRows=1)
+    ts = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9CA3AF")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#EEF3F8")]),
+    ])
+
+    for idx, (_, row) in enumerate(df.iterrows(), start=1):
+        if str(row["status"]).upper() == "PASS":
+            ts.add("BACKGROUND", (3, idx), (3, idx), colors.HexColor("#DCFCE7"))
+        else:
+            ts.add("BACKGROUND", (3, idx), (3, idx), colors.HexColor("#FEE2E2"))
+
+    table.setStyle(ts)
+    return table
+
+
+# =========================================================
 # CHARTS / PDF
 # =========================================================
 def fig_to_rl_image(fig, width=500):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", dpi=160)
     buf.seek(0)
-    return RLImage(buf, width=width, height=width * 0.58)
+    img_reader = ImageReader(buf)
+    iw, ih = img_reader.getSize()
+    aspect = ih / float(iw) if iw else 0.58
+    return RLImage(buf, width=width, height=width * aspect)
 
 
 def add_reference_lines(ax, selected_test):
@@ -1036,52 +1239,52 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
         pagesize=A4,
         rightMargin=36,
         leftMargin=36,
-        topMargin=36,
-        bottomMargin=36,
+        topMargin=30,
+        bottomMargin=30,
     )
-    styles = getSampleStyleSheet()
+    styles = get_pdf_styles()
     elements = []
 
-    elements.append(Paragraph("ACR MRI Large Phantom QC Compliance Report", styles["Title"]))
+    results_df = normalize_history_df(results_df).copy()
+    results_df = sort_tests_acr(results_df)
+
+    add_pdf_header(
+        elements,
+        styles,
+        title="ACR MRI Large Phantom QC Compliance Report",
+        subtitle="Formal session summary with parsed measurements and trend review",
+        site_name=site_name,
+        scanner_name=scanner_name,
+        include_logo=True,
+    )
+
+    elements.append(Paragraph("Session Information", styles["SectionHeadingCustom"]))
+    elements.append(Paragraph(f"<b>Session label:</b> {session_label}", styles["MetaCustom"]))
+    elements.append(Paragraph(f"<b>Timestamp:</b> {timestamp_str}", styles["MetaCustom"]))
+    elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(timestamp_str)}", styles["MetaCustom"]))
     elements.append(Spacer(1, 8))
-    elements.append(Paragraph(f"<b>Site:</b> {site_name}", styles["Normal"]))
-    elements.append(Paragraph(f"<b>Scanner:</b> {scanner_name}", styles["Normal"]))
-    elements.append(Paragraph(f"<b>Session label:</b> {session_label}", styles["Normal"]))
-    elements.append(Paragraph(f"<b>Timestamp:</b> {timestamp_str}", styles["Normal"]))
-    elements.append(Spacer(1, 12))
 
     overall = "PASS" if (results_df["status"] == "PASS").all() else "FAIL"
-    elements.append(Paragraph(f"<b>Overall result:</b> {overall}", styles["Heading2"]))
-    elements.append(Spacer(1, 8))
-
-    table_data = [["Test", "Value", "Criteria", "Status"]]
-    for _, row in results_df.iterrows():
-        val = "" if pd.isna(row["value"]) else f"{row['value']} {row['unit']}".strip()
-        table_data.append([row["test_name"], val, row["criteria"], row["status"]])
-
-    table = Table(table_data, colWidths=[160, 90, 180, 70])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
-            ]
+    overall_color = "#166534" if overall == "PASS" else "#991B1B"
+    elements.append(
+        Paragraph(
+            f'<font color="{overall_color}"><b>Overall result: {overall}</b></font>',
+            styles["SectionHeadingCustom"],
         )
     )
-    elements.append(table)
-    elements.append(Spacer(1, 14))
+    elements.append(Spacer(1, 4))
 
-    elements.append(Paragraph("Parsed details", styles["Heading2"]))
+    elements.append(Paragraph("Results Summary", styles["SectionHeadingCustom"]))
+    elements.append(build_results_table(results_df, styles))
+    elements.append(Spacer(1, 12))
+
+    elements.append(Paragraph("Parsed Details", styles["SectionHeadingCustom"]))
     for _, row in results_df.iterrows():
-        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["Normal"]))
+        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"]))
         elements.append(Spacer(1, 4))
 
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph("Trend charts", styles["Heading2"]))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph("Trend Charts", styles["SectionHeadingCustom"]))
     added_any_chart = False
 
     for test_name in results_df["test_name"].tolist():
@@ -1089,12 +1292,13 @@ def build_pdf_report(results_df, history_df, site_name, scanner_name, session_la
         if fig is not None:
             added_any_chart = True
             elements.append(Spacer(1, 6))
-            elements.append(Paragraph(test_name, styles["Heading3"]))
+            elements.append(Paragraph(test_name, styles["MetaCustom"]))
             elements.append(fig_to_rl_image(fig, width=500))
             plt.close(fig)
+            elements.append(Spacer(1, 8))
 
     if not added_any_chart:
-        elements.append(Paragraph("No historical numeric data yet for trend charts.", styles["Normal"]))
+        elements.append(Paragraph("No historical numeric data yet for trend charts.", styles["MetaCustom"]))
 
     doc.build(elements)
     return pdf_path
@@ -1108,18 +1312,25 @@ def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, sca
         pagesize=A4,
         rightMargin=36,
         leftMargin=36,
-        topMargin=36,
-        bottomMargin=36,
+        topMargin=30,
+        bottomMargin=30,
     )
 
-    styles = getSampleStyleSheet()
+    styles = get_pdf_styles()
     elements = []
 
     df = normalize_history_df(history_df).copy()
     if df.empty:
-        elements.append(Paragraph("ACR MRI Large Phantom QC Session Summary", styles["Title"]))
-        elements.append(Spacer(1, 12))
-        elements.append(Paragraph("No history data available.", styles["Normal"]))
+        add_pdf_header(
+            elements,
+            styles,
+            title="ACR MRI Large Phantom QC Session Summary",
+            subtitle="Historical report",
+            site_name=site_name or "",
+            scanner_name=scanner_name or "",
+            include_logo=True,
+        )
+        elements.append(Paragraph("No history data available.", styles["MetaCustom"]))
         doc.build(elements)
         return pdf_path
 
@@ -1132,69 +1343,55 @@ def build_session_summary_pdf(history_df, site_name=None, scanner_name=None, sca
             df = df[df["scanner_name"] == scanner_name].copy()
 
     if df.empty:
-        elements.append(Paragraph("ACR MRI Large Phantom QC Session Summary", styles["Title"]))
-        elements.append(Spacer(1, 12))
-        elements.append(Paragraph("No matching session history found for the selected scanner.", styles["Normal"]))
+        add_pdf_header(
+            elements,
+            styles,
+            title="ACR MRI Large Phantom QC Session Summary",
+            subtitle="Historical report",
+            site_name=site_name or "",
+            scanner_name=scanner_name or "",
+            include_logo=True,
+        )
+        elements.append(Paragraph("No matching session history found for the selected scanner.", styles["MetaCustom"]))
         doc.build(elements)
         return pdf_path
 
     df["timestamp_dt"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df = df.sort_values("timestamp_dt", ascending=False)
 
-    elements.append(Paragraph("ACR MRI Large Phantom QC Session Summary", styles["Title"]))
-    elements.append(Spacer(1, 8))
-
-    if site_name:
-        elements.append(Paragraph(f"<b>Site:</b> {site_name}", styles["Normal"]))
-    if scanner_name:
-        elements.append(Paragraph(f"<b>Scanner:</b> {scanner_name}", styles["Normal"]))
-    if scanner_id:
-        elements.append(Paragraph(f"<b>System ID:</b> {scanner_id}", styles["Normal"]))
-
-    elements.append(Spacer(1, 14))
+    add_pdf_header(
+        elements,
+        styles,
+        title="ACR MRI Large Phantom QC Session Summary",
+        subtitle="All recorded sessions for the selected system",
+        site_name=site_name or "",
+        scanner_name=scanner_name or "",
+        include_logo=True,
+    )
 
     group_cols = ["timestamp", "session_label", "site_name", "scanner_name", "scanner_id"]
     grouped_items = list(df.groupby(group_cols, sort=False))
 
     for idx, ((timestamp, session_label, g_site, g_scanner, g_scanner_id), g) in enumerate(grouped_items):
-        g = g.copy().sort_values("test_name")
+        g = sort_tests_acr(g.copy())
         overall = "PASS" if (g["status"] == "PASS").all() else "FAIL"
-        display_date = str(timestamp).split("T")[0] if str(timestamp) else ""
+        overall_color = "#166534" if overall == "PASS" else "#991B1B"
 
-        elements.append(Paragraph(f"<b>Session date:</b> {display_date}", styles["Heading2"]))
-        elements.append(Paragraph(f"<b>Timestamp:</b> {timestamp}", styles["Normal"]))
-        elements.append(Paragraph(f"<b>Session label:</b> {session_label}", styles["Normal"]))
-        elements.append(Paragraph(f"<b>Site:</b> {g_site}", styles["Normal"]))
-        elements.append(Paragraph(f"<b>Scanner:</b> {g_scanner}", styles["Normal"]))
-        elements.append(Paragraph(f"<b>Overall result:</b> {overall}", styles["Normal"]))
-        elements.append(Spacer(1, 8))
-
-        table_data = [["Test", "Value", "Tolerance", "Status"]]
-
-        for _, row in g.iterrows():
-            value_txt = "" if pd.isna(row["value"]) else f"{row['value']} {row['unit']}".strip()
-            table_data.append([
-                str(row["test_name"]),
-                value_txt,
-                str(row["criteria"]),
-                str(row["status"]),
-            ])
-
-        table = Table(table_data, colWidths=[180, 90, 170, 70])
-        table.setStyle(
-            TableStyle(
-                [
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
-                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
-                ]
+        elements.append(Paragraph(f"Session {idx + 1}", styles["SectionHeadingCustom"]))
+        elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(timestamp)}", styles["MetaCustom"]))
+        elements.append(Paragraph(f"<b>Timestamp:</b> {timestamp}", styles["MetaCustom"]))
+        elements.append(Paragraph(f"<b>Session label:</b> {session_label}", styles["MetaCustom"]))
+        elements.append(Paragraph(f"<b>Site:</b> {g_site}", styles["MetaCustom"]))
+        elements.append(Paragraph(f"<b>Scanner:</b> {g_scanner}", styles["MetaCustom"]))
+        elements.append(Paragraph(f"<b>System ID:</b> {g_scanner_id}", styles["MetaCustom"]))
+        elements.append(
+            Paragraph(
+                f'<font color="{overall_color}"><b>Overall result:</b> {overall}</font>',
+                styles["MetaCustom"],
             )
         )
-
-        elements.append(table)
+        elements.append(Spacer(1, 8))
+        elements.append(build_results_table(g, styles))
 
         if idx < len(grouped_items) - 1:
             elements.append(PageBreak())
@@ -1211,69 +1408,64 @@ def build_single_session_pdf(session_df):
         pagesize=A4,
         rightMargin=36,
         leftMargin=36,
-        topMargin=36,
-        bottomMargin=36,
+        topMargin=30,
+        bottomMargin=30,
     )
 
-    styles = getSampleStyleSheet()
+    styles = get_pdf_styles()
     elements = []
 
     df = normalize_history_df(session_df).copy()
+    df = sort_tests_acr(df)
+
     if df.empty:
-        elements.append(Paragraph("ACR MRI Large Phantom QC Session Report", styles["Title"]))
-        elements.append(Spacer(1, 12))
-        elements.append(Paragraph("No data found for the selected session.", styles["Normal"]))
+        add_pdf_header(
+            elements,
+            styles,
+            title="ACR MRI Large Phantom QC Session Report",
+            subtitle="Selected historical session",
+            include_logo=True,
+        )
+        elements.append(Paragraph("No data found for the selected session.", styles["MetaCustom"]))
         doc.build(elements)
         return pdf_path
 
-    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    df = df.sort_values("test_name")
-
     first = df.iloc[0]
     overall = "PASS" if (df["status"] == "PASS").all() else "FAIL"
-    display_date = str(first["timestamp"]).split("T")[0] if str(first["timestamp"]) else ""
+    overall_color = "#166534" if overall == "PASS" else "#991B1B"
 
-    elements.append(Paragraph("ACR MRI Large Phantom QC Session Report", styles["Title"]))
+    add_pdf_header(
+        elements,
+        styles,
+        title="ACR MRI Large Phantom QC Session Report",
+        subtitle="Formal single-session report generated from stored history",
+        site_name=str(first["site_name"]),
+        scanner_name=str(first["scanner_name"]),
+        include_logo=True,
+    )
+
+    elements.append(Paragraph("Session Information", styles["SectionHeadingCustom"]))
+    elements.append(Paragraph(f"<b>Session date:</b> {format_session_date(first['timestamp'])}", styles["MetaCustom"]))
+    elements.append(Paragraph(f"<b>Timestamp:</b> {first['timestamp']}", styles["MetaCustom"]))
+    elements.append(Paragraph(f"<b>Session label:</b> {first['session_label']}", styles["MetaCustom"]))
+    elements.append(Paragraph(f"<b>System ID:</b> {first['scanner_id']}", styles["MetaCustom"]))
     elements.append(Spacer(1, 8))
-    elements.append(Paragraph(f"<b>Session date:</b> {display_date}", styles["Normal"]))
-    elements.append(Paragraph(f"<b>Timestamp:</b> {first['timestamp']}", styles["Normal"]))
-    elements.append(Paragraph(f"<b>Session label:</b> {first['session_label']}", styles["Normal"]))
-    elements.append(Paragraph(f"<b>Site:</b> {first['site_name']}", styles["Normal"]))
-    elements.append(Paragraph(f"<b>Scanner:</b> {first['scanner_name']}", styles["Normal"]))
-    elements.append(Paragraph(f"<b>System ID:</b> {first['scanner_id']}", styles["Normal"]))
-    elements.append(Spacer(1, 8))
-    elements.append(Paragraph(f"<b>Overall result:</b> {overall}", styles["Heading2"]))
-    elements.append(Spacer(1, 10))
 
-    table_data = [["Test", "Value", "Tolerance", "Status"]]
-    for _, row in df.iterrows():
-        value_txt = "" if pd.isna(row["value"]) else f"{row['value']} {row['unit']}".strip()
-        table_data.append([
-            str(row["test_name"]),
-            value_txt,
-            str(row["criteria"]),
-            str(row["status"]),
-        ])
-
-    table = Table(table_data, colWidths=[180, 90, 170, 70])
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4F81BD")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
-            ]
+    elements.append(
+        Paragraph(
+            f'<font color="{overall_color}"><b>Overall result: {overall}</b></font>',
+            styles["SectionHeadingCustom"],
         )
     )
-    elements.append(table)
+    elements.append(Spacer(1, 6))
+
+    elements.append(Paragraph("Results Summary", styles["SectionHeadingCustom"]))
+    elements.append(build_results_table(df, styles))
     elements.append(Spacer(1, 12))
 
-    elements.append(Paragraph("Parsed details", styles["Heading2"]))
+    elements.append(Paragraph("Details", styles["SectionHeadingCustom"]))
     for _, row in df.iterrows():
-        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["Normal"]))
+        elements.append(Paragraph(f"<b>{row['test_name']}:</b> {row['details']}", styles["MetaCustom"]))
         elements.append(Spacer(1, 4))
 
     doc.build(elements)
@@ -1287,7 +1479,7 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 st.caption(
     "Upload ACR MRI phantom .txt files, auto-evaluate pass/fail, "
-    "save history with timestamp, and generate a PDF report with trendlines."
+    "save history with timestamp, and generate PDF reports from current or historical sessions."
 )
 
 if "session_saved" not in st.session_state:
@@ -1408,6 +1600,7 @@ if uploaded_files:
     st.session_state.combined_results = combined_results
 
     results_df = pd.DataFrame(combined_results)
+    results_df = sort_tests_acr(results_df)
 
     st.subheader("Current session results")
     st.dataframe(
@@ -1543,6 +1736,7 @@ else:
     combined_results = st.session_state.get("combined_results", [])
     if combined_results:
         results_df = pd.DataFrame(combined_results)
+        results_df = sort_tests_acr(results_df)
 
 # =========================================================
 # TREND DATA PREP
@@ -1607,7 +1801,10 @@ else:
         )
 
     system_df = front_trend_df[front_trend_df["scanner_id"] == selected_system].copy()
-    test_options = sorted(system_df["test_name"].dropna().astype(str).unique().tolist())
+    system_df = sort_tests_acr(system_df)
+
+    test_options = system_df["test_name"].dropna().astype(str).unique().tolist()
+    test_options = sorted(test_options, key=acr_sort_key)
 
     with panel_col2:
         selected_test = st.selectbox(
